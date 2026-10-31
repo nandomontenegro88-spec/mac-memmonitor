@@ -5,7 +5,6 @@ set -euo pipefail
 
 REPO="nandomontenegro88-spec/mac-memmonitor"
 ZIP_URL="https://github.com/$REPO/releases/latest/download/MemMonitor.zip"
-RAW="https://raw.githubusercontent.com/$REPO/main"
 
 # requisitos: chip Apple + macOS 14 ou mais novo
 [ "$(uname -m)" = "arm64" ] || { echo "O MemMonitor só funciona em Macs com chip Apple (M1 ou mais novo)."; exit 1; }
@@ -40,7 +39,13 @@ if [ -r /dev/tty ] && ! sudo -n /usr/sbin/purge >/dev/null 2>&1; then
   printf "Quer que o botão 'Liberar memória' pare de pedir a senha? (só libera o comando purge) [s/N] " > /dev/tty
   read -r ans < /dev/tty || ans=""
   if [ "$ans" = "s" ] || [ "$ans" = "S" ]; then
-    curl -fsSL "$RAW/tirar-senha.sh" | bash
+    # o script vem da versão que acabou de ser instalada (a tag), não da branch main: o que corre com sudo não muda por baixo
+    TAG="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" | sed 's|.*/||')"
+    if [ -n "$TAG" ] && [ "$TAG" != "latest" ]; then
+      curl -fsSL "https://raw.githubusercontent.com/$REPO/$TAG/tirar-senha.sh" | bash
+    else
+      echo "Não consegui descobrir a versão; pulei esse passo. Dá para fazer depois: bash tirar-senha.sh"
+    fi
   fi
 fi
 

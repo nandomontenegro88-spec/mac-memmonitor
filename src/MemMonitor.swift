@@ -6,8 +6,9 @@ let gb = 1024.0 * 1024 * 1024
 
 // MARK: - Dados
 
-struct Mem {
+struct Mem: Equatable {
     var app = 0.0, wired = 0.0, compressed = 0.0, cached = 0.0
+    var free = 0.0, uncompressed = 0.0, swapUsed = 0.0, swapTotal = 0.0
     var total = Double(ProcessInfo.processInfo.physicalMemory)
     var pressure = 1
     var used: Double { app + wired + compressed }
@@ -25,10 +26,14 @@ func readMem() -> Mem {
     let page = Double(vm_kernel_page_size)
     var m = Mem()
     // mesma conta do Monitor de Atividade
-    m.app = Double(UInt64(s.internal_page_count) - UInt64(s.purgeable_count)) * page
+    m.app = Double(max(Int64(s.internal_page_count) - Int64(s.purgeable_count), 0)) * page
     m.wired = Double(s.wire_count) * page
     m.compressed = Double(s.compressor_page_count) * page
     m.cached = Double(s.external_page_count) * page
+    m.free = Double(s.free_count) * page
+    m.uncompressed = Double(s.total_uncompressed_pages_in_compressor) * page
+    var sw = xsw_usage(), swl = MemoryLayout<xsw_usage>.size
+    if sysctlbyname("vm.swapusage", &sw, &swl, nil, 0) == 0 { m.swapUsed = Double(sw.xsu_used); m.swapTotal = Double(sw.xsu_total) }
     var p: Int32 = 1
     var l = MemoryLayout<Int32>.size
     sysctlbyname("kern.memorystatus_vm_pressure_level", &p, &l, nil, 0)
@@ -36,24 +41,30 @@ func readMem() -> Mem {
     return m
 }
 
-var lastTicks: (UInt32, UInt32, UInt32, UInt32)?
-func readCPU() -> Double {
-    var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
-    var info = host_cpu_load_info_data_t()
-    _ = withUnsafeMutablePointer(to: &info) {
-        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-            host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+/// Cada quem lê a CPU com o seu próprio «contador anterior». Se dois partilhassem um só,
+/// uma leitura encurtava a janela da outra e aparecia 0 % ou 100 % do nada.
+final class CPUMeter {
+    private var last: (UInt32, UInt32, UInt32, UInt32)?
+    func read() -> Double {
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
+        var info = host_cpu_load_info_data_t()
+        _ = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+            }
         }
+        let t = info.cpu_ticks
+        defer { last = t }
+        guard let l = last else { return 0 }
+        let busy = Double(t.0 &- l.0) + Double(t.1 &- l.1) + Double(t.3 &- l.3)
+        let all = busy + Double(t.2 &- l.2)
+        return all > 0 ? busy / all : 0
     }
-    let t = info.cpu_ticks
-    defer { lastTicks = t }
-    guard let l = lastTicks else { return 0 }
-    let busy = Double(t.0 &- l.0) + Double(t.1 &- l.1) + Double(t.3 &- l.3)
-    let all = busy + Double(t.2 &- l.2)
-    return all > 0 ? busy / all : 0
 }
+let panelCPU = CPUMeter(), historyCPU = CPUMeter()
 
-struct Row: Identifiable {
+struct Row: Identifiable, Equatable {
+    static func == (a: Row, b: Row) -> Bool { a.id == b.id && a.bytes == b.bytes && a.cpu == b.cpu }
     let app: NSRunningApplication
     let bytes: Double
     var cpu = 0.0
@@ -62,14 +73,7 @@ struct Row: Identifiable {
 
 /// RSS por app aberto, somando os processos auxiliares que vivem dentro do .app
 func readTopApps() -> [Row] {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/bin/ps")
-    task.arguments = ["-axo", "rss=,pcpu=,command="]
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    try? task.run()
-    let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-    task.waitUntilExit()
+    let out = shText("/bin/ps", ["-axo", "rss=,pcpu=,command="])
     let me = ProcessInfo.processInfo.processIdentifier
     let apps = NSWorkspace.shared.runningApplications.filter {
         $0.activationPolicy == .regular && $0.bundleURL != nil && $0.processIdentifier != me
@@ -90,29 +94,22 @@ func readTopApps() -> [Row] {
 
 // MARK: - Mais dados do Mac
 
-@discardableResult
-func sh(_ exe: String, _ args: [String]) -> Data {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: exe)
-    task.arguments = args
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = Pipe()
-    try? task.run()
-    let d = pipe.fileHandleForReading.readDataToEndOfFile()
-    task.waitUntilExit()
-    return d
-}
-
-func ok(_ exe: String, _ args: [String]) -> Bool {
+/// Roda um comando: devolve a saída e se terminou bem. O erro vai para o lixo (um pipe que ninguém lê pode travar o comando).
+func run(_ exe: String, _ args: [String]) -> (out: Data, ok: Bool) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
-    p.standardOutput = Pipe(); p.standardError = Pipe()
-    guard (try? p.run()) != nil else { return false }
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return (Data(), false) }
+    let d = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    return p.terminationStatus == 0
+    return (d, p.terminationStatus == 0)
 }
+
+@discardableResult func sh(_ exe: String, _ args: [String]) -> Data { run(exe, args).out }
+func ok(_ exe: String, _ args: [String]) -> Bool { run(exe, args).ok }
 
 // MARK: - Atualizações (releases do GitHub)
 
@@ -121,18 +118,30 @@ let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVer
 
 struct Update { var version: String; var url: URL }
 
+/// 1.10 > 1.9; «1.2» é mais novo que «1.2-beta».
 func versionGreater(_ a: String, than b: String) -> Bool {
-    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
-    for i in 0..<max(x.count, y.count) {
-        let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+    func parse(_ v: String) -> (nums: [Int], pre: Bool) {
+        let parts = v.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let nums = (parts.first ?? "").split(separator: ".").map { Int($0.prefix(while: \.isNumber)) ?? 0 }
+        return (nums, parts.count > 1)
+    }
+    let x = parse(a), y = parse(b)
+    for i in 0..<max(x.nums.count, y.nums.count) {
+        let p = i < x.nums.count ? x.nums[i] : 0, q = i < y.nums.count ? y.nums[i] : 0
         if p != q { return p > q }
     }
-    return false
+    return y.pre && !x.pre
+}
+
+/// Lê a linha `lowpowermode` do `pmset -g` pelo último número, sem depender do espaçamento.
+func lowPowerOn(_ pmset: String) -> Bool {
+    pmset.split(separator: "\n").first { $0.contains("lowpowermode") }
+        .flatMap { $0.split(whereSeparator: \.isWhitespace).last }.map(String.init) == "1"
 }
 
 func shText(_ exe: String, _ args: [String]) -> String { String(decoding: sh(exe, args), as: UTF8.self) }
 
-struct Batt {
+struct Batt: Equatable {
     var pct = 0, cycles = 0, adapterW = 0
     var charging = false, plugged = false
     var minutes: Int?
@@ -187,16 +196,18 @@ func fmtUptime(_ s: TimeInterval) -> String {
 
 struct Sample { var mem: Double; var cpu: Double; var batt: Double? }
 
+/// Os 4 cards abaixo do anel da Memória: o selecionado mostra os detalhes por baixo.
+enum MemCard: String, CaseIterable { case apps, system, compressed, cpu }
+
 enum Tab: String, CaseIterable { case mem = "Memória", bat = "Bateria", health = "Saúde" }
 
 // MARK: - Modelo
 
 final class Model: ObservableObject {
     @Published var tab = Tab.mem
-    @Published var sliding = false  // true durante o deslize de abas: a rolagem dos números fica parada
+    @Published var memCard = MemCard.apps
     @Published var heroOn: Set<Tab> = []   // abas cujo anel/número já «subiram»: ao voltar a uma aba, a animação repete
     @Published var shown = false   // painel aberto: dispara a entrada animada
-    @Published var swap = true     // false por instantes ao trocar de aba: o conteúdo novo entra em cascata
     @Published var mem = readMem()
     @Published var cpu = 0.0
     @Published var rows: [Row] = []
@@ -215,54 +226,74 @@ final class Model: ObservableObject {
     @Published var down = 0.0
     @Published var up = 0.0
     @Published var loginItems: [String] = []
-    @Published var loginNote: String?
     @Published var update: Update?
     @Published var updateState = ""
     private var lastUpdateCheck = Date.distantPast
+    private var checkingUpdate = false
+    private var refreshing = false          // evita empilhar leituras quando o Mac está lento
+    private var recording = false
+    private var slowRunning: Set<Tab> = []
 
     private var lastNet: (d: Double, u: Double, t: Date)?
     private var slowStamps: [Tab: Date] = [:]
 
-    /// Uma leitura barata no arranque: a 1.ª abertura já tem lista de apps e bateria, e a altura da janela não salta.
+    /// Só publica se mudou: cada publicação redesenha o painel inteiro.
+    func setApps(_ r: [Row]) {
+        let top = Array(r.prefix(5)), c = Array(r.sorted { $0.cpu > $1.cpu }.prefix(3))
+        if top != rows { rows = top }
+        if c != cpuRows { cpuRows = c }
+    }
+
+    /// Uma leitura barata no arranque: a 1.ª abertura já tem lista de apps e bateria.
     func prefetch() {
         DispatchQueue.global().async {
             let r = readTopApps(), b = readBattery()
-            DispatchQueue.main.async { self.rows = Array(r.prefix(5)); self.cpuRows = Array(r.sorted { $0.cpu > $1.cpu }.prefix(3)); self.batt = b }
+            DispatchQueue.main.async { self.setApps(r); self.batt = b }
         }
     }
 
     /// Uma amostra de ~16 s (RAM, CPU, bateria), mesmo com o painel fechado; guarda ~2 h para os gráficos.
     func record() {
-        let m = readMem().fraction, c = readCPU()
+        guard !recording else { return }
+        recording = true
+        let m = readMem().fraction, c = historyCPU.read()
         DispatchQueue.global().async {
-            let b = readBattery().map { Double($0.pct) }
+            let b = readBattery()
             DispatchQueue.main.async {
-                self.history.append(Sample(mem: m, cpu: c, batt: b))
+                self.recording = false
+                if let b, b != self.batt { self.batt = b } // a bateria fica fresca (≤16 s) sem ler a cada 2 s
+                self.history.append(Sample(mem: m, cpu: c, batt: b.map { Double($0.pct) }))
                 if self.history.count > 450 { self.history.removeFirst(self.history.count - 450) }
             }
         }
     }
 
     func refresh(visible: Bool) {
-        mem = readMem()
+        let m = readMem()
+        if m != mem { mem = m }
         guard visible else { return } // fechado: só a RAM, que alimenta o número da barra
-        cpu = readCPU()
+        let c = (panelCPU.read() * 100).rounded() / 100
+        if c != cpu { cpu = c }
         let tab = self.tab
-        DispatchQueue.global().async {
-            let r = tab != .bat ? readTopApps() : nil
-            let b = readBattery()
-            let n = tab == .health ? readNet() : nil
-            DispatchQueue.main.async {
-                if let r { self.rows = Array(r.prefix(5)); self.cpuRows = Array(r.sorted { $0.cpu > $1.cpu }.prefix(3)) }
-                if let b { self.batt = b }
-                if let n {
-                    let now = Date()
-                    if let l = self.lastNet, now.timeIntervalSince(l.t) > 0.5 {
-                        let dt = now.timeIntervalSince(l.t)
-                        self.down = max(n.down - l.d, 0) / dt
-                        self.up = max(n.up - l.u, 0) / dt
+        if !refreshing {
+            refreshing = true
+            DispatchQueue.global().async {
+                let r = tab != .bat ? readTopApps() : nil
+                let b = tab == .bat ? readBattery() : nil
+                let n = tab == .health ? readNet() : nil
+                DispatchQueue.main.async {
+                    self.refreshing = false
+                    if let r { self.setApps(r) }
+                    if let b, b != self.batt { self.batt = b }
+                    if let n {
+                        let now = Date()
+                        // se passou muito tempo desde a última leitura (saíste da aba), não inventa uma velocidade média
+                        if let l = self.lastNet, case let dt = now.timeIntervalSince(l.t), dt > 0.5, dt < 5 {
+                            self.down = max(n.down - l.d, 0) / dt
+                            self.up = max(n.up - l.u, 0) / dt
+                        }
+                        self.lastNet = (n.down, n.up, now)
                     }
-                    self.lastNet = (n.down, n.up, now)
                 }
             }
         }
@@ -272,6 +303,8 @@ final class Model: ObservableObject {
 
     /// Coisas lentas (system_profiler, diskutil, System Events): cada aba só pede o que mostra
     func refreshSlow(for tab: Tab) {
+        guard !slowRunning.contains(tab) else { return }
+        slowRunning.insert(tab)
         slowStamps[tab] = Date()
         DispatchQueue.global().async {
             var pct: Int?, word: String?
@@ -282,16 +315,18 @@ final class Model: ObservableObject {
                 word = h["sppower_battery_health"] as? String
             }
             var lp: Bool?, smart: String?, v: URLResourceValues?, items: [String]?
-            if tab == .bat { lp = shText("/usr/bin/pmset", ["-g"]).contains("lowpowermode         1") }
+            if tab == .bat { lp = lowPowerOn(shText("/usr/bin/pmset", ["-g"])) }
             if tab == .health {
                 smart = shText("/usr/sbin/diskutil", ["info", "/"]).split(separator: "\n")
                     .first { $0.contains("SMART Status") }?.split(separator: ":").last.map { $0.trimmingCharacters(in: .whitespaces) }
                 v = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
-                let li = shText("/usr/bin/osascript", ["-e", "tell application \"System Events\" to get name of every login item"])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                items = li.isEmpty ? [] : li.components(separatedBy: ", ")
+                // um nome por linha: nomes com vírgula não se partem em dois
+                items = shText("/usr/bin/osascript", ["-e", "tell application \"System Events\" to set n to name of every login item",
+                                                      "-e", "set AppleScript's text item delimiters to linefeed", "-e", "return n as text"])
+                    .split(separator: "\n").map(String.init)
             }
             DispatchQueue.main.async {
+                self.slowRunning.remove(tab)
                 self.healthPct = pct; self.healthWord = word
                 if let lp { self.lowPower = lp }
                 if tab == .health {
@@ -305,26 +340,42 @@ final class Model: ObservableObject {
     }
 
     /// Pergunta ao GitHub qual é a última release (no máx. 1× a cada 12 h). Não envia nada do Mac.
+    /// Só conta como «consultado» se o GitHub respondeu: sem rede no login, tenta de novo na hora seguinte.
     func checkUpdate() {
-        guard Date().timeIntervalSince(lastUpdateCheck) > 12 * 3600 else { return }
-        lastUpdateCheck = Date()
+        guard !checkingUpdate, Date().timeIntervalSince(lastUpdateCheck) > 12 * 3600 else { return }
+        var source = "https://api.github.com/repos/\(repoSlug)/releases/latest"
+        var trusted = true
+        #if DEBUG
         let args = CommandLine.arguments
-        let override = args.firstIndex(of: "--update-url").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } // só para testes
-        guard let api = URL(string: override ?? "https://api.github.com/repos/\(repoSlug)/releases/latest") else { return }
+        if let i = args.firstIndex(of: "--update-url"), i + 1 < args.count { source = args[i + 1]; trusted = false } // só para testes
+        #endif
+        guard let api = URL(string: source) else { return }
+        checkingUpdate = true
         var req = URLRequest(url: api)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.timeoutInterval = 15
         URLSession.shared.dataTask(with: req) { data, _, _ in
-            guard let data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let tag = j["tag_name"] as? String else { return }
-            let v = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-            guard versionGreater(v, than: currentVersion),
-                  let assets = j["assets"] as? [[String: Any]],
-                  let a = assets.first(where: { ($0["name"] as? String) == "MemMonitor.zip" }),
-                  let s = a["browser_download_url"] as? String, let u = URL(string: s),
-                  override != nil || ["github.com", "objects.githubusercontent.com"].contains(u.host ?? "") else { return }
+            var found: Update?, answered = false
+            if let data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let tag = j["tag_name"] as? String {
+                answered = true
+                let v = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+                if versionGreater(v, than: currentVersion),
+                   let assets = j["assets"] as? [[String: Any]],
+                   let a = assets.first(where: { ($0["name"] as? String) == "MemMonitor.zip" }),
+                   let s = a["browser_download_url"] as? String, let u = URL(string: s),
+                   !trusted || ["github.com", "objects.githubusercontent.com"].contains(u.host ?? "") {
+                    found = Update(version: v, url: u)
+                }
+            }
             DispatchQueue.main.async {
-                self.update = Update(version: v, url: u)
-                if CommandLine.arguments.contains("--auto-update") { self.installUpdate() } // só para testes
+                self.checkingUpdate = false
+                if answered { self.lastUpdateCheck = Date() }
+                if let found {
+                    self.update = found
+                    #if DEBUG
+                    if CommandLine.arguments.contains("--auto-update") { self.installUpdate() } // só para testes
+                    #endif
+                }
             }
         }.resume()
     }
@@ -363,20 +414,11 @@ final class Model: ObservableObject {
         status = nil
         let before = readMem().cached
         DispatchQueue.global().async {
-            func run(_ exe: String, _ args: [String]) -> Bool {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: exe)
-                p.arguments = args
-                p.standardError = Pipe()
-                try? p.run()
-                p.waitUntilExit()
-                return p.terminationStatus == 0
-            }
-            let ok = run("/usr/bin/sudo", ["-n", "/usr/sbin/purge"])
-                || run("/usr/bin/osascript", ["-e", "do shell script \"/usr/sbin/purge\" with administrator privileges"])
+            let done = ok("/usr/bin/sudo", ["-n", "/usr/sbin/purge"])
+                || ok("/usr/bin/osascript", ["-e", "do shell script \"/usr/sbin/purge\" with administrator privileges"])
             DispatchQueue.main.async {
                 let freed = max(before - readMem().cached, 0)
-                self.status = ok ? String(format: "Pronto: %.1f GB de cache liberados", freed / gb) : "Cancelado"
+                self.status = done ? String(format: "Pronto: %.1f GB de cache liberados", freed / gb) : "Cancelado"
                 self.busy = false
                 self.refresh(visible: true)
             }
@@ -388,7 +430,7 @@ final class Model: ObservableObject {
         lowPower = on
         DispatchQueue.global().async {
             sh("/usr/bin/osascript", ["-e", "do shell script \"/usr/bin/pmset -a lowpowermode \(on ? 1 : 0)\" with administrator privileges"])
-            let real = shText("/usr/bin/pmset", ["-g"]).contains("lowpowermode         1")
+            let real = lowPowerOn(shText("/usr/bin/pmset", ["-g"]))
             DispatchQueue.main.async { self.lowPower = real }
         }
     }
@@ -426,6 +468,8 @@ let okColor = Color(red: 0.133, green: 0.773, blue: 0.369)   // #22C55E
 let warnColor = Color(red: 0.961, green: 0.620, blue: 0.043) // #F59E0B
 let badColor = Color(red: 0.937, green: 0.267, blue: 0.267)  // #EF4444
 let muted = Color(red: 0.58, green: 0.64, blue: 0.72)        // #94A3B8
+let blueColor = Color(red: 0.38, green: 0.65, blue: 0.98)
+let purpleColor = Color(red: 0.75, green: 0.52, blue: 0.99)
 
 func pressureInfo(_ p: Int) -> (String, Color) {
     p >= 4 ? ("Memória sob pressão", badColor) : p == 2 ? ("Memória a ficar cheia", warnColor) : ("Tudo certo com a memória", okColor)
@@ -446,13 +490,14 @@ struct Ring: View {
     }
 }
 
-/// Mola única do anel e do número grande: começam e acabam juntos. Parada durante o deslize de abas.
-func heroAnim(_ m: Model) -> Animation? {
+/// Mola única do anel e do número grande: começam e acabam juntos.
+var heroAnim: Animation? {
     NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .spring(response: 0.55, dampingFraction: 1)
 }
 
 struct Tile: View {
     var label: String, value: String, dot: Color
+    var selected = false
     var body: some View {
         VStack(spacing: 4) {
             Text(value).font(.system(size: 14, weight: .semibold)).monospacedDigit().foregroundStyle(.white)
@@ -463,8 +508,16 @@ struct Tile: View {
             }
         }
         .frame(maxWidth: .infinity).padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(0.06)))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.09), lineWidth: 1))
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(selected ? 0.13 : 0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(selected ? dot.opacity(0.9) : Color.white.opacity(0.09), lineWidth: selected ? 1.5 : 1))
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous)) // o card inteiro é clicável
+    }
+}
+
+/// feedback instantâneo ao premir um card
+struct TilePress: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.scaleEffect(configuration.isPressed ? 0.96 : 1).animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
 
@@ -489,9 +542,8 @@ struct Press: ButtonStyle {
 struct Enter: ViewModifier {
     @ObservedObject var model: Model
     var i: Int
-    var swaps = false
     func body(content: Content) -> some View {
-        let on = model.shown && (!swaps || model.swap)
+        let on = model.shown
         let still = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         content.opacity(on ? 1 : 0)
             .offset(y: on || still ? 0 : 12)
@@ -500,10 +552,26 @@ struct Enter: ViewModifier {
 }
 
 extension View {
-    func enter(_ m: Model, _ i: Int, swaps: Bool = false) -> some View { modifier(Enter(model: m, i: i, swaps: swaps)) }
+    func enter(_ m: Model, _ i: Int) -> some View { modifier(Enter(model: m, i: i)) }
 }
 
 final class Hover: ObservableObject { @Published var on = false }
+
+/// Barra de progresso fina (lista de apps e potência do carregador).
+struct Bar: View {
+    var fraction: Double
+    var height: CGFloat
+    var body: some View {
+        GeometryReader { g in
+            Capsule().fill(Color.white.opacity(0.09))
+                .overlay(alignment: .leading) {
+                    Capsule().fill(LinearGradient(colors: [okColor.opacity(0.6), okColor], startPoint: .leading, endPoint: .trailing))
+                        .frame(width: max(g.size.width * min(max(fraction, 0), 1), 4))
+                }
+        }
+        .frame(height: height)
+    }
+}
 
 struct AppRow: View {
     let row: Row
@@ -514,14 +582,7 @@ struct AppRow: View {
             Image(nsImage: row.app.icon ?? NSImage()).resizable().frame(width: 28, height: 28)
             VStack(alignment: .leading, spacing: 5) {
                 Text(row.app.localizedName ?? "?").font(.system(size: 13, weight: .medium)).foregroundStyle(.white).lineLimit(1)
-                GeometryReader { g in
-                    Capsule().fill(Color.white.opacity(0.09))
-                        .overlay(alignment: .leading) {
-                            Capsule().fill(LinearGradient(colors: [okColor.opacity(0.6), okColor], startPoint: .leading, endPoint: .trailing))
-                                .frame(width: max(g.size.width * row.bytes / max(maxBytes, 1), 4))
-                        }
-                }
-                .frame(height: 4)
+                Bar(fraction: row.bytes / max(maxBytes, 1), height: 4)
             }
             ZStack(alignment: .trailing) {
                 Text(String(format: "%.0f MB", row.bytes / 1024 / 1024))
@@ -596,8 +657,87 @@ struct BatHero: View, Animatable {
     }
 }
 
+func gbText(_ bytes: Double) -> String { String(format: "%.1f GB", bytes / gb) }
+
+/// Uma linha de detalhe: título, explicação curta, valor e (opcional) barra.
+struct DetailRow: View {
+    var title: String, sub: String, value: String
+    var fraction: Double?
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .medium)).foregroundStyle(.white)
+                if !sub.isEmpty { Text(sub).font(.system(size: 11)).foregroundStyle(muted).lineLimit(2) }
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 5) {
+                Text(value).font(.system(size: 12.5, weight: .semibold)).monospacedDigit().foregroundStyle(.white)
+                if let f = fraction { Bar(fraction: f, height: 4).frame(width: 84) }
+            }
+        }
+        .padding(.vertical, 7).padding(.horizontal, 10)
+    }
+}
+
+struct MemDetail: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        let m = model.mem
+        VStack(alignment: .leading, spacing: 4) {
+            switch model.memCard {
+            case .apps:
+                heading("APPS QUE MAIS USAM")
+                let mx = model.rows.first?.bytes ?? 1
+                card { ForEach(Array(model.rows.enumerated()), id: \.offset) { _, r in AppRow(row: r, maxBytes: mx) } }
+            case .system:
+                heading("O QUE O SISTEMA USA")
+                card {
+                    DetailRow(title: "Sistema (fixa)", sub: "Kernel e drivers: não dá para liberar", value: gbText(m.wired), fraction: m.wired / m.total)
+                    DetailRow(title: "Cache de arquivos", sub: "O macOS libera sozinho quando precisa", value: gbText(m.cached), fraction: m.cached / m.total)
+                    DetailRow(title: "Livre", sub: "Sem nenhum uso agora", value: gbText(m.free), fraction: m.free / m.total)
+                }
+            case .compressed:
+                heading("MEMÓRIA COMPRIMIDA")
+                card {
+                    DetailRow(title: "Comprimida agora", sub: "Espaço que ocupa na RAM", value: gbText(m.compressed), fraction: m.compressed / m.total)
+                    DetailRow(title: "Equivale a", sub: "O que ocuparia sem compressão", value: gbText(m.uncompressed), fraction: m.uncompressed / m.total)
+                    DetailRow(title: "Economia", sub: "RAM poupada pela compressão", value: gbText(max(m.uncompressed - m.compressed, 0)), fraction: max(m.uncompressed - m.compressed, 0) / m.total)
+                    DetailRow(title: "Swap em disco", sub: "Só entra quando comprimir não basta", value: gbText(m.swapUsed), fraction: m.swapTotal > 0 ? m.swapUsed / m.swapTotal : 0)
+                }
+            case .cpu:
+                heading("MAIS USAM A CPU")
+                var load = [0.0, 0.0, 0.0]
+                let _ = getloadavg(&load, 3)
+                card {
+                    ForEach(Array(model.cpuRows.enumerated()), id: \.offset) { _, r in
+                        HStack(spacing: 10) {
+                            Image(nsImage: r.app.icon ?? NSImage()).resizable().frame(width: 22, height: 22)
+                            Text(r.app.localizedName ?? "?").font(.system(size: 12.5, weight: .medium)).foregroundStyle(.white).lineLimit(1)
+                            Spacer()
+                            Text(String(format: "%.0f%%", r.cpu)).font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(muted)
+                        }
+                        .padding(.vertical, 5).padding(.horizontal, 10)
+                    }
+                    DetailRow(title: "Carga média (1 min)", sub: "De \(ProcessInfo.processInfo.activeProcessorCount) núcleos", value: String(format: "%.2f", load[0]),
+                              fraction: load[0] / Double(ProcessInfo.processInfo.activeProcessorCount))
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 244, alignment: .topLeading)
+    }
+    func heading(_ t: String) -> some View {
+        Text(t).font(.system(size: 10.5, weight: .semibold)).tracking(0.7).foregroundStyle(muted).padding(.horizontal, 10)
+    }
+    func card<C: View>(@ViewBuilder _ c: () -> C) -> some View {
+        VStack(spacing: 0) { c() }.padding(.vertical, 4).glassCard()
+    }
+}
+
 struct MemView: View {
     @ObservedObject var model: Model
+    func card(_ c: MemCard, _ label: String, _ value: String, _ dot: Color) -> some View {
+        Button { model.memCard = c } label: { Tile(label: label, value: value, dot: dot, selected: model.memCard == c) }.buttonStyle(TilePress())
+    }
     var body: some View {
         let (title, color) = pressureInfo(model.mem.pressure)
         VStack(spacing: 14) {
@@ -613,15 +753,16 @@ struct MemView: View {
             }
 
             MemHero(used: model.heroOn.contains(.mem) ? model.mem.used / gb : 0, total: model.mem.total / gb, color: color)
-                .animation(heroAnim(model), value: model.heroOn.contains(.mem) ? model.mem.used : 0)
+                .animation(heroAnim, value: model.heroOn.contains(.mem) ? model.mem.used : 0)
             .padding(.vertical, 2)
 
             HStack(spacing: 8) {
-                Tile(label: "Apps", value: String(format: "%.1f GB", model.mem.app / gb), dot: okColor)
-                Tile(label: "Sistema", value: String(format: "%.1f GB", model.mem.wired / gb), dot: Color(red: 0.38, green: 0.65, blue: 0.98))
-                Tile(label: "Comprim.", value: String(format: "%.1f GB", model.mem.compressed / gb), dot: warnColor)
-                Tile(label: "CPU", value: String(format: "%.0f%%", model.cpu * 100), dot: Color(red: 0.75, green: 0.52, blue: 0.99))
+                card(.apps, "Apps", String(format: "%.1f GB", model.mem.app / gb), okColor)
+                card(.system, "Sistema", String(format: "%.1f GB", model.mem.wired / gb), blueColor)
+                card(.compressed, "Comprim.", String(format: "%.1f GB", model.mem.compressed / gb), warnColor)
+                card(.cpu, "CPU", String(format: "%.0f%%", model.cpu * 100), purpleColor)
             }
+            .animation(.easeOut(duration: 0.15), value: model.memCard)
 
             VStack(spacing: 7) {
                 Button { model.purge() } label: {
@@ -633,16 +774,7 @@ struct MemView: View {
                     .font(.system(size: 11)).foregroundStyle(muted)
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("APPS QUE MAIS USAM").font(.system(size: 10.5, weight: .semibold)).tracking(0.7)
-                    .foregroundStyle(muted).padding(.horizontal, 10)
-                let mx = model.rows.first?.bytes ?? 1
-                VStack(spacing: 0) { ForEach(Array(model.rows.enumerated()), id: \.offset) { _, r in AppRow(row: r, maxBytes: mx) } }
-                    .padding(.vertical, 4)
-                    .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.white.opacity(0.045)))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
-            }
-
+            MemDetail(model: model)
         }
     }
 }
@@ -671,13 +803,13 @@ struct BatView: View {
                             : b.plugged ? (b.pct >= 100 ? "carregada" : "carga em pausa")
                             : (b.minutes.map { "restam \(fmtMin($0))" } ?? "a calcular…"))
                     .padding(.vertical, 2)
-                    .animation(heroAnim(model), value: model.heroOn.contains(.bat) ? b.pct : 0)
+                    .animation(heroAnim, value: model.heroOn.contains(.bat) ? b.pct : 0)
 
                 HStack(spacing: 8) {
                     Tile(label: b.watts >= 0 ? "A entrar" : "Consumo", value: String(format: "%.0f W", abs(b.watts)), dot: okColor)
-                    Tile(label: "Carregador", value: b.plugged ? "\(b.adapterW) W" : "—", dot: Color(red: 0.38, green: 0.65, blue: 0.98))
+                    Tile(label: "Carregador", value: b.plugged ? "\(b.adapterW) W" : "—", dot: blueColor)
                     Tile(label: "Saúde", value: model.healthPct.map { "\($0)%" } ?? "—", dot: warnColor)
-                    Tile(label: "Ciclos", value: "\(b.cycles)", dot: Color(red: 0.75, green: 0.52, blue: 0.99))
+                    Tile(label: "Ciclos", value: "\(b.cycles)", dot: purpleColor)
                 }
 
                 if b.plugged && b.adapterW > 0 {
@@ -687,12 +819,7 @@ struct BatView: View {
                             Spacer()
                             Text(String(format: "%.0f de %d W", max(b.watts, 0), b.adapterW)).font(.system(size: 12)).monospacedDigit().foregroundStyle(muted)
                         }
-                        GeometryReader { g in
-                            Capsule().fill(Color.white.opacity(0.09)).overlay(alignment: .leading) {
-                                Capsule().fill(LinearGradient(colors: [okColor.opacity(0.6), okColor], startPoint: .leading, endPoint: .trailing))
-                                    .frame(width: max(g.size.width * max(b.watts, 0) / Double(b.adapterW), 4))
-                            }
-                        }.frame(height: 6)
+                        Bar(fraction: max(b.watts, 0) / Double(b.adapterW), height: 6)
                     }
                     .padding(12).glassCard()
                 }
@@ -767,9 +894,9 @@ struct HealthView: View {
 
             HStack(spacing: 8) {
                 Tile(label: "Disco livre", value: model.diskTotal > 0 ? String(format: "%.0f GB", model.diskFree / gb) : "—", dot: okColor)
-                Tile(label: "SMART", value: model.smart == "Verified" ? "OK" : (model.smart ?? "—"), dot: Color(red: 0.38, green: 0.65, blue: 0.98))
+                Tile(label: "SMART", value: model.smart == "Verified" ? "OK" : (model.smart ?? "—"), dot: blueColor)
                 Tile(label: "Ligado há", value: fmtUptime(bootUptime()), dot: warnColor)
-                Tile(label: "Térmico", value: thermal == .nominal ? "Normal" : thermal == .fair ? "Morno" : "Quente", dot: Color(red: 0.75, green: 0.52, blue: 0.99))
+                Tile(label: "Térmico", value: thermal == .nominal ? "Normal" : thermal == .fair ? "Morno" : "Quente", dot: purpleColor)
             }
 
             HStack(spacing: 0) {
@@ -803,12 +930,12 @@ struct HealthView: View {
                     Text("Atividade recente").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
                     Spacer()
                     HStack(spacing: 4) { Circle().fill(warnColor).frame(width: 6, height: 6); Text("RAM").font(.system(size: 10.5)).foregroundStyle(muted) }
-                    HStack(spacing: 4) { Circle().fill(Color(red: 0.75, green: 0.52, blue: 0.99)).frame(width: 6, height: 6); Text("CPU").font(.system(size: 10.5)).foregroundStyle(muted) }
+                    HStack(spacing: 4) { Circle().fill(purpleColor).frame(width: 6, height: 6); Text("CPU").font(.system(size: 10.5)).foregroundStyle(muted) }
                 }
                 if model.history.count > 1 {
                     ZStack {
                         Spark(values: model.history.map { $0.mem }, color: warnColor)
-                        Spark(values: model.history.map { $0.cpu }, color: Color(red: 0.75, green: 0.52, blue: 0.99))
+                        Spark(values: model.history.map { $0.cpu }, color: purpleColor)
                     }.frame(height: 34)
                 } else {
                     Text("A recolher dados…").font(.system(size: 11)).foregroundStyle(muted).frame(height: 34)
@@ -1010,9 +1137,18 @@ class Delegate: NSObject, NSApplicationDelegate {
     var ticks = 0
     var prevTab = Tab.mem
     var visible: Bool { panel?.isVisible ?? false }
+    #if DEBUG
+    var testing: Bool { CommandLine.arguments.contains("--show") }
+    #else
+    var testing: Bool { false }
+    #endif
     var still: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        #if DEBUG
+        if CommandLine.arguments.contains("--selftest") { selfTest() }
+        #endif
+        _ = panelCPU.read(); _ = historyCPU.read() // primeira leitura só marca o ponto de partida
         item.button?.target = self
         item.button?.action = #selector(toggle)
         item.button?.image = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "Memória")
@@ -1023,15 +1159,15 @@ class Delegate: NSObject, NSApplicationDelegate {
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
 
+        #if DEBUG
         if CommandLine.arguments.contains("--show") {
             if let i = CommandLine.arguments.firstIndex(of: "--tab"), let t = Tab(rawValue: CommandLine.arguments[i + 1]) { model.tab = t }
+            if let i = CommandLine.arguments.firstIndex(of: "--card"), let c = MemCard(rawValue: CommandLine.arguments[i + 1]) { model.memCard = c }
             if CommandLine.arguments.contains("--switch") { DispatchQueue.main.asyncAfter(deadline: .now() + 10) { self.model.tab = .health } }
             if CommandLine.arguments.contains("--back") { DispatchQueue.main.asyncAfter(deadline: .now() + 13) { self.model.tab = .mem } }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                self.toggle()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { print("WIN", self.panel?.windowNumber ?? 0, "alpha", self.panel?.alphaValue ?? -1, "frame", self.panel?.frame ?? .zero, "host", self.host?.frame ?? .zero, "tab", self.model.tab.rawValue, "shown", self.model.shown, "vis", self.visible); fflush(stdout) }
-            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.toggle() }
         }
+        #endif
     }
 
     func makePanel() -> GlassPanel {
@@ -1068,12 +1204,9 @@ class Delegate: NSObject, NSApplicationDelegate {
         p.appearance = NSAppearance(named: .darkAqua)
         panel = p
 
-        // a altura muda quando chegam dados novos
-        model.$rows.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.resize() }.store(in: &bag)
-        model.$batt.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.resize() }.store(in: &bag)
-        model.$loginItems.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.resize() }.store(in: &bag)
+        // a altura da janela só muda quando aparece a faixa de atualização
         model.$update.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.resize() }.store(in: &bag)
-        // trocar de aba: o conteúdo antigo sai, o novo entra em cascata
+        // trocar de aba: o anel/número da aba que chega sobem de 0
         model.$tab.dropFirst().sink { [weak self] t in
             guard let self else { return }
             // a aba que chega «sobe» de 0 ao valor enquanto desliza; a que sai só zera depois de sair de vista
@@ -1081,10 +1214,7 @@ class Delegate: NSObject, NSApplicationDelegate {
             self.prevTab = t
             self.model.heroOn.insert(t)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { if self.model.tab != old { self.model.heroOn.remove(old) } }
-            self.model.sliding = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { self.model.sliding = false }
             self.model.refresh(visible: true)
-            DispatchQueue.main.async { self.resize() }
         }.store(in: &bag)
         return p
     }
@@ -1092,7 +1222,7 @@ class Delegate: NSObject, NSApplicationDelegate {
     func tick() {
         ticks += 1
         // fechado: só atualiza o número da barra, de 6 em 6 s
-        if ticks % 8 == 1 { model.record() }
+        if ticks % 8 == 0 { model.record() } // ~16 s
         if ticks % 1800 == 0 { model.checkUpdate() } // a cada ~1 h tenta; só consulta o GitHub se passaram 12 h
         if !visible && ticks > 1 && ticks % 3 != 0 { return }
         model.refresh(visible: visible)
@@ -1137,9 +1267,11 @@ class Delegate: NSObject, NSApplicationDelegate {
             panel.animator().alphaValue = 1
             if !still { panel.animator().setFrame(end, display: true) }
         }
-        if CommandLine.arguments.contains("--show") { print("WIN0", panel.windowNumber); fflush(stdout) }
+        #if DEBUG
+        if testing { print("WIN0", panel.windowNumber); fflush(stdout) }
+        #endif
         DispatchQueue.main.async { self.model.shown = true; self.model.heroOn = [self.model.tab]; self.prevTab = self.model.tab } // dispara a cascata dos blocos e o anel a encher
-        if !CommandLine.arguments.contains("--show") { // em teste o painel não fecha com cliques de fora
+        if !testing { // em teste o painel não fecha com cliques de fora
             monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             guard let self, let bw = self.item.button?.window, !bw.frame.contains(NSEvent.mouseLocation) else { return }
             self.close()
@@ -1156,6 +1288,38 @@ class Delegate: NSObject, NSApplicationDelegate {
         }, completionHandler: { panel.orderOut(nil); self.model.shown = false; self.model.heroOn = [] })
     }
 }
+
+#if DEBUG
+/// `swiftc -DDEBUG …` e `./MemMonitor --selftest` (veja tests/run.sh)
+func selfTest() {
+    var fails = 0
+    func check(_ c: Bool, _ m: String) { if !c { print("FALHOU: \(m)"); fails += 1 } }
+    check(versionGreater("1.10", than: "1.9"), "1.10 > 1.9")
+    check(!versionGreater("1.1", than: "1.1.0"), "1.1 == 1.1.0")
+    check(!versionGreater("1.0", than: "1.1"), "1.0 < 1.1")
+    check(versionGreater("2.0", than: "1.99.9"), "2.0 > 1.99.9")
+    check(versionGreater("1.2", than: "1.2-beta"), "1.2 > 1.2-beta")
+    check(!versionGreater("1.2-beta", than: "1.2"), "1.2-beta < 1.2")
+    check(versionGreater("1.3-beta", than: "1.2"), "1.3-beta > 1.2")
+    check(lowPowerOn("Battery Power:\n lowpowermode         1\n sleep 1"), "lowpowermode 1")
+    check(!lowPowerOn(" lowpowermode         0"), "lowpowermode 0")
+    check(lowPowerOn(" lowpowermode\t1"), "lowpowermode com tab")
+    check(!lowPowerOn("sleep 1"), "sem a linha")
+    check(fmtMin(59) == "59 min" && fmtMin(61) == "1 h 1 min", "fmtMin")
+    check(fmtUptime(30 * 3600) == "30 h" && fmtUptime(72 * 3600) == "3 dias" && fmtUptime(600) == "10 min", "fmtUptime")
+    check(readMem().total > 0 && readMem().fraction <= 1, "readMem")
+    check(readMem().free >= 0 && readMem().swapTotal >= readMem().swapUsed, "free e swap coerentes")
+    // duas leituras de CPU não se atrapalham: o `b.read()` do meio não pode encurtar a janela de `a`
+    let a = CPUMeter(), b = CPUMeter()
+    _ = a.read(); _ = b.read()
+    let end = Date().addingTimeInterval(0.4); var x = 0.0
+    while Date() < end { x += sqrt(x + 1) }
+    _ = b.read()
+    check(a.read() > 0.03, "a janela de CPU de `a` sobrevive à leitura de `b`")
+    print(fails == 0 ? "tudo ok" : "\(fails) falhas")
+    exit(fails == 0 ? 0 : 1)
+}
+#endif
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)

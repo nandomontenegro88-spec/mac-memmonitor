@@ -1,7 +1,7 @@
 # MemMonitor
 
 Medidor de **memória, bateria e saúde** do Mac na barra de menu. Clica no ícone da RAM e abre um painel com três abas:
-**Memória** (apps que mais pesam, botão Fechar, Liberar memória), **Bateria** (percentual, potência do carregador, saúde, ciclos)
+**Memória** (anel, quatro cards clicáveis — Apps, Sistema, Comprimida e CPU — com os detalhes de cada um embaixo, botão Fechar e Liberar memória), **Bateria** (percentual, potência do carregador, saúde, ciclos)
 e **Saúde** (selo geral, disco, rede, CPU e itens de início).
 
 Requisitos: Mac com **chip Apple** (M1 ou mais novo) e **macOS 14+**.
@@ -47,6 +47,14 @@ O **modo de pouca energia** continua pedindo a senha sempre, de propósito.
 ## Desinstalar
 
 Sai pelo ícone da barra de menu, apaga `MemMonitor.app` de Aplicativos e, se usaste o passo sem-senha, `sudo rm /etc/sudoers.d/memmonitor`.
+
+## Testes
+
+```bash
+bash tests/run.sh
+```
+
+Compila com `-DDEBUG` e roda os testes embutidos (comparação de versões, leitura do `pmset`, formatação, leitura de CPU e memória).
 
 ## Compilar
 
