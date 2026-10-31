@@ -640,7 +640,7 @@ func pressureInfo(_ p: Int) -> (String, Color) {
     p >= 4 ? ("Memória sob pressão", badColor) : p == 2 ? ("Memória a ficar cheia", warnColor) : ("Tudo certo com a memória", okColor)
 }
 
-/// Ícone da barra de menu: arco de 270° (aberto em baixo) que mostra a memória livre.
+/// Ícone da barra de menu: arco de 270° (aberto em baixo) que mostra a memória EM USO (o número ao lado é o livre).
 /// A cor segue a pressão da memória; a pista usa a cor do texto, por isso funciona em tema claro e escuro.
 func gaugeImage(fraction: Double, pressure: Int) -> NSImage {
     let color: NSColor = pressure >= 4 ? .systemRed : pressure == 2 ? .systemOrange : .systemGreen
@@ -1591,19 +1591,20 @@ class Delegate: NSObject, NSApplicationDelegate {
         return p
     }
 
-    /// Barra de menu: arco com a memória livre e o número de GB livres (total − usada). Só redesenha o arco quando muda de verdade.
+    /// Barra de menu: o arco mostra a memória em uso e o número mostra os GB livres (total − usada): as duas leituras no mesmo canto.
+    /// Só redesenha o arco quando muda de verdade.
     func updateStatusItem() {
         let m = model.mem
         let free = max(m.total - m.used, 0)
         item.button?.title = String(format: " %.1f GB", free / gb)
-        let key = "\(Int(free / m.total * 40))-\(m.pressure)"
+        let key = "\(Int(m.fraction * 40))-\(m.pressure)"
         if key != lastIcon {
             lastIcon = key
-            item.button?.image = gaugeImage(fraction: free / m.total, pressure: m.pressure)
+            item.button?.image = gaugeImage(fraction: m.fraction, pressure: m.pressure)
             item.button?.imagePosition = .imageLeading
         }
-        item.button?.toolTip = String(format: "Memória livre: %.1f GB de %.0f GB (em uso: %.1f GB)", free / gb, m.total / gb, m.used / gb)
-        item.button?.setAccessibilityLabel("Memória livre")
+        item.button?.toolTip = String(format: "Em uso: %.1f GB de %.0f GB · Livre: %.1f GB", m.used / gb, m.total / gb, free / gb)
+        item.button?.setAccessibilityLabel("Memória em uso (arco) e livre (número)")
     }
 
     func tick() {
