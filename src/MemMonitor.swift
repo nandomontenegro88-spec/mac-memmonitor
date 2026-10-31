@@ -63,6 +63,92 @@ final class CPUMeter {
 }
 let panelCPU = CPUMeter(), historyCPU = CPUMeter()
 
+func sysctlInt(_ name: String) -> Int {
+    var v: Int32 = 0, l = MemoryLayout<Int32>.size
+    sysctlbyname(name, &v, &l, nil, 0)
+    return Int(v)
+}
+/// Núcleos de desempenho (P) e de eficiência (E). Nos chips Apple, os de eficiência vêm primeiro na lista de núcleos.
+let perfCores = sysctlInt("hw.perflevel0.logicalcpu"), effCores = sysctlInt("hw.perflevel1.logicalcpu")
+
+/// Uso de cada núcleo (0…1) e o total dividido em usuário/sistema, desde a leitura anterior.
+final class CoreMeter {
+    private var last: [(busy: Double, idle: Double, user: Double, sys: Double)] = []
+    func read() -> (cores: [Double], user: Double, sys: Double) {
+        var n: natural_t = 0, cnt: mach_msg_type_number_t = 0
+        var info: processor_info_array_t?
+        guard host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &n, &info, &cnt) == KERN_SUCCESS, let info else { return ([], 0, 0) }
+        defer { vm_deallocate(mach_task_self_, vm_address_t(bitPattern: info), vm_size_t(cnt) * vm_size_t(MemoryLayout<integer_t>.size)) }
+        var now: [(busy: Double, idle: Double, user: Double, sys: Double)] = []
+        for i in 0..<Int(n) {
+            let b = i * Int(CPU_STATE_MAX)
+            let u = Double(info[b + Int(CPU_STATE_USER)]), sy = Double(info[b + Int(CPU_STATE_SYSTEM)])
+            let ni = Double(info[b + Int(CPU_STATE_NICE)]), id = Double(info[b + Int(CPU_STATE_IDLE)])
+            now.append((u + sy + ni, id, u + ni, sy))
+        }
+        let prev = last
+        last = now
+        guard prev.count == now.count else { return (Array(repeating: 0, count: now.count), 0, 0) }
+        var cores: [Double] = [], all = 0.0, user = 0.0, sys = 0.0
+        for (a, p) in zip(now, prev) {
+            let busy = max(a.busy - p.busy, 0), idle = max(a.idle - p.idle, 0), total = busy + idle
+            cores.append(total > 0 ? busy / total : 0)
+            all += total; user += max(a.user - p.user, 0); sys += max(a.sys - p.sys, 0)
+        }
+        return (cores, all > 0 ? user / all : 0, all > 0 ? sys / all : 0)
+    }
+}
+let coreMeter = CoreMeter()
+
+struct Temps: Equatable {
+    var cpuAvg = 0.0, cpuMax = 0.0
+    var chips: Double?, ssd: Double?, battery: Double?
+}
+
+/// Sensores de temperatura do Mac (chips Apple). Não há API oficial: a leitura usa funções internas do IOKit,
+/// carregadas em tempo de execução. Se não existirem (outro macOS/Mac), `read()` devolve nil e o app segue normal.
+final class Thermals {
+    private typealias Create = @convention(c) (CFAllocator?) -> Unmanaged<CFTypeRef>?
+    private typealias SetMatching = @convention(c) (CFTypeRef, CFDictionary) -> Int32
+    private typealias CopyServices = @convention(c) (CFTypeRef) -> Unmanaged<CFArray>?
+    private typealias CopyProperty = @convention(c) (CFTypeRef, CFString) -> Unmanaged<CFTypeRef>?
+    private typealias CopyEvent = @convention(c) (CFTypeRef, Int64, Int32, Int64) -> Unmanaged<CFTypeRef>?
+    private typealias GetFloat = @convention(c) (CFTypeRef, Int32) -> Double
+    private var services: [(name: String, ref: CFTypeRef)] = []
+    private var copyEvent: CopyEvent?, getFloat: GetFloat?
+    private var client: CFTypeRef?   // tem de viver tanto quanto os serviços: se for liberado, as leituras usam memória morta e o app cai
+
+    init() {
+        _ = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY)
+        func sym<T>(_ n: String, _ t: T.Type) -> T? { dlsym(UnsafeMutableRawPointer(bitPattern: -2), n).map { unsafeBitCast($0, to: t) } }
+        guard let create = sym("IOHIDEventSystemClientCreate", Create.self), let setMatching = sym("IOHIDEventSystemClientSetMatching", SetMatching.self),
+              let copyServices = sym("IOHIDEventSystemClientCopyServices", CopyServices.self), let copyProp = sym("IOHIDServiceClientCopyProperty", CopyProperty.self),
+              let ev = sym("IOHIDServiceClientCopyEvent", CopyEvent.self), let gf = sym("IOHIDEventGetFloatValue", GetFloat.self),
+              let client = create(kCFAllocatorDefault)?.takeRetainedValue() else { return }
+        self.client = client
+        _ = setMatching(client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary) // sensores de temperatura
+        guard let list = copyServices(client)?.takeRetainedValue() as? [CFTypeRef] else { return }
+        services = list.map { ((copyProp($0, "Product" as CFString)?.takeRetainedValue() as? String) ?? "", $0) }
+        copyEvent = ev; getFloat = gf
+    }
+
+    func read() -> Temps? {
+        guard let copyEvent, let getFloat else { return nil }
+        var cpu: [Double] = [], chips: [Double] = [], ssd: [Double] = [], bat: [Double] = []
+        for s in services {
+            guard let e = copyEvent(s.ref, 15, 0, 0)?.takeRetainedValue() else { continue } // 15 = temperatura
+            let v = getFloat(e, 15 << 16)
+            guard v > 10, v < 120 else { continue } // há sensores sem uso que devolvem valores absurdos
+            if s.name.hasPrefix("PMU tdie") { cpu.append(v) } else if s.name.hasPrefix("PMU2 tdie") { chips.append(v) }
+            else if s.name.hasPrefix("NAND") { ssd.append(v) } else if s.name.hasPrefix("gas gauge") { bat.append(v) }
+        }
+        guard !cpu.isEmpty else { return nil }
+        func avg(_ a: [Double]) -> Double? { a.isEmpty ? nil : a.reduce(0, +) / Double(a.count) }
+        return Temps(cpuAvg: avg(cpu)!, cpuMax: cpu.max()!, chips: avg(chips), ssd: avg(ssd), battery: avg(bat))
+    }
+}
+let thermals = Thermals()
+
 struct Row: Identifiable, Equatable {
     static func == (a: Row, b: Row) -> Bool { a.id == b.id && a.bytes == b.bytes && a.cpu == b.cpu }
     let app: NSRunningApplication
@@ -208,7 +294,8 @@ func fmtUptime(_ s: TimeInterval) -> String {
 struct Sample { var mem: Double; var cpu: Double; var batt: Double? }
 
 /// Os 4 cards abaixo do anel da Memória: o selecionado mostra os detalhes por baixo.
-enum MemCard: String, CaseIterable { case apps, system, compressed, cpu }
+enum MemCard: String, CaseIterable { case apps, system, compressed, available }
+enum CPUCard: String, CaseIterable { case live, cores, temp, load }
 
 enum BatCard: String, CaseIterable { case power, charger, health, cycles }
 enum HealthCard: String, CaseIterable { case disk, smart, uptime, thermal }
@@ -222,7 +309,19 @@ func thermalInfo(_ t: ProcessInfo.ThermalState) -> (title: String, sub: String) 
     }
 }
 
-enum Tab: String, CaseIterable { case mem = "Memória", bat = "Bateria", health = "Saúde" }
+enum Tab: String, CaseIterable { case mem = "Memória", cpu = "CPU", bat = "Bateria", health = "Saúde" }
+
+struct Live: Equatable { var cpu: Double; var temp: Double? }
+
+/// Tudo o que a aba CPU mostra, num só valor: uma atualização = uma passagem de desenho (e não seis).
+struct CPUData: Equatable {
+    var total = 0.0
+    var cores: [Double] = []
+    var userPct = 0.0, sysPct = 0.0
+    var temps: Temps?
+    var live: [Live] = []     // últimos 60 s, 1 por segundo
+    var load = [0.0, 0.0, 0.0]
+}
 
 // MARK: - Modelo
 
@@ -231,12 +330,20 @@ final class Model: ObservableObject {
     @Published var memCard = MemCard.apps
     @Published var batCard = BatCard.power
     @Published var healthCard = HealthCard.disk
+    @Published var cpuCard = CPUCard.live
+    @Published var cpuData = CPUData()
+    var cpu: Double { cpuData.total }
+    var cores: [Double] { cpuData.cores }
+    var userPct: Double { cpuData.userPct }
+    var sysPct: Double { cpuData.sysPct }
+    var temps: Temps? { cpuData.temps }
+    var live: [Live] { cpuData.live }
+    var load: [Double] { cpuData.load }
     @Published var diskModel: String?
     @Published var diskSolid: Bool?
     @Published var heroOn: Set<Tab> = []   // abas cujo anel/número já «subiram»: ao voltar a uma aba, a animação repete
     @Published var shown = false   // painel aberto: dispara a entrada animada
     @Published var mem = readMem()
-    @Published var cpu = 0.0
     @Published var rows: [Row] = []
     @Published var cpuRows: [Row] = []
     @Published var history: [Sample] = []
@@ -258,6 +365,8 @@ final class Model: ObservableObject {
     private var lastUpdateCheck = Date.distantPast
     private var checkingUpdate = false
     private var refreshing = false          // evita empilhar leituras quando o Mac está lento
+    private var lastApps = Date.distantPast
+    private var lastMem = Date.distantPast
     private var recording = false
     private var slowRunning: Set<Tab> = []
 
@@ -296,13 +405,29 @@ final class Model: ObservableObject {
     }
 
     func refresh(visible: Bool) {
-        let m = readMem()
-        if m != mem { mem = m }
+        let tab = self.tab
+        // na aba CPU (1×/s) a RAM só se atualiza a cada 2 s: cada publicação redesenha o painel
+        if !visible || tab != .cpu || Date().timeIntervalSince(lastMem) >= 1.9 {
+            lastMem = Date()
+            let m = readMem()
+            if m != mem { mem = m }
+        }
         guard visible else { return } // fechado: só a RAM, que alimenta o número da barra
         let c = (panelCPU.read() * 100).rounded() / 100
-        if c != cpu { cpu = c }
-        let tab = self.tab
-        if !refreshing {
+        let k = coreMeter.read() // barato; lê sempre para a janela de tempo ser curta quando abres a aba CPU
+        if tab == .cpu || tab == .health {
+            var d = cpuData
+            d.temps = thermals.read()
+            if tab == .cpu {
+                d.total = c; d.cores = k.cores; d.userPct = k.user; d.sysPct = k.sys
+                var l = [0.0, 0.0, 0.0]; getloadavg(&l, 3); d.load = l
+                d.live.append(Live(cpu: c, temp: d.temps?.cpuAvg))
+                if d.live.count > 60 { d.live.removeFirst(d.live.count - 60) }
+            }
+            if d != cpuData { cpuData = d } // uma só publicação
+        }
+        if !refreshing && Date().timeIntervalSince(lastApps) >= 1.9 { // ps/ioreg/netstat: no máx. 1× a cada 2 s, mesmo com a aba CPU a 1 s
+            lastApps = Date()
             refreshing = true
             DispatchQueue.global().async {
                 let r = tab != .bat ? readTopApps() : nil
@@ -325,7 +450,7 @@ final class Model: ObservableObject {
             }
         }
         // lazy: o que é lento só é lido quando a aba é aberta, e no máximo 1× por minuto
-        if tab != .mem, Date().timeIntervalSince(slowStamps[tab] ?? .distantPast) > 60 { refreshSlow(for: tab) }
+        if tab == .bat || tab == .health, Date().timeIntervalSince(slowStamps[tab] ?? .distantPast) > 60 { refreshSlow(for: tab) }
     }
 
     /// Coisas lentas (system_profiler, diskutil, System Events): cada aba só pede o que mostra
@@ -686,7 +811,7 @@ struct MemHero: View, Animatable {
     }
 }
 
-struct BatHero: View, Animatable {
+struct PctHero: View, Animatable {
     var pct: Double
     var color: Color
     var caption: String
@@ -742,8 +867,8 @@ struct MemDetail: View {
                 detailHeading("O QUE O SISTEMA USA")
                 detailCard {
                     DetailRow(title: "Sistema (fixa)", sub: "Kernel e drivers: não dá para liberar", value: gbText(m.wired), fraction: m.wired / m.total)
-                    DetailRow(title: "Cache de arquivos", sub: "O macOS libera sozinho quando precisa", value: gbText(m.cached), fraction: m.cached / m.total)
-                    DetailRow(title: "Livre", sub: "Sem nenhum uso agora", value: gbText(m.free), fraction: m.free / m.total)
+                    DetailRow(title: "Pressão da memória", sub: "Quão apertada está a RAM", value: m.pressure >= 4 ? "Crítica" : m.pressure == 2 ? "Média" : "Normal")
+                    DetailRow(title: "Memória instalada", sub: "", value: gbText(m.total))
                 }
             case .compressed:
                 detailHeading("MEMÓRIA COMPRIMIDA")
@@ -753,22 +878,12 @@ struct MemDetail: View {
                     DetailRow(title: "Economia", sub: "RAM poupada pela compressão", value: gbText(max(m.uncompressed - m.compressed, 0)), fraction: max(m.uncompressed - m.compressed, 0) / m.total)
                     DetailRow(title: "Swap em disco", sub: "Só entra quando comprimir não basta", value: gbText(m.swapUsed), fraction: m.swapTotal > 0 ? m.swapUsed / m.swapTotal : 0)
                 }
-            case .cpu:
-                detailHeading("MAIS USAM A CPU")
-                var load = [0.0, 0.0, 0.0]
-                let _ = getloadavg(&load, 3)
+            case .available:
+                detailHeading("MEMÓRIA DISPONÍVEL")
                 detailCard {
-                    ForEach(Array(model.cpuRows.enumerated()), id: \.offset) { _, r in
-                        HStack(spacing: 10) {
-                            Image(nsImage: r.app.icon ?? NSImage()).resizable().frame(width: 22, height: 22)
-                            Text(r.app.localizedName ?? "?").font(.system(size: 12.5, weight: .medium)).foregroundStyle(.white).lineLimit(1)
-                            Spacer()
-                            Text(String(format: "%.0f%%", r.cpu)).font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(muted)
-                        }
-                        .padding(.vertical, 5).padding(.horizontal, 10)
-                    }
-                    DetailRow(title: "Carga média (1 min)", sub: "De \(ProcessInfo.processInfo.activeProcessorCount) núcleos", value: String(format: "%.2f", load[0]),
-                              fraction: load[0] / Double(ProcessInfo.processInfo.activeProcessorCount))
+                    DetailRow(title: "Livre", sub: "Sem nenhum uso agora", value: gbText(m.free), fraction: m.free / m.total)
+                    DetailRow(title: "Cache de arquivos", sub: "O macOS libera sozinho quando precisa", value: gbText(m.cached), fraction: m.cached / m.total)
+                    DetailRow(title: "Total disponível", sub: "Livre + cache", value: gbText(m.free + m.cached), fraction: (m.free + m.cached) / m.total)
                 }
             }
         }
@@ -793,14 +908,14 @@ struct MemView: View {
             }
 
             MemHero(used: model.heroOn.contains(.mem) ? model.mem.used / gb : 0, total: model.mem.total / gb, color: color)
-                .animation(heroAnim, value: model.heroOn.contains(.mem) ? model.mem.used : 0)
+                .animation(heroAnim, value: model.heroOn.contains(.mem))
             .padding(.vertical, 2)
 
             HStack(spacing: 8) {
                 TileButton(label: "Apps", value: String(format: "%.1f GB", model.mem.app / gb), dot: okColor, selected: model.memCard == .apps) { model.memCard = .apps }
                 TileButton(label: "Sistema", value: String(format: "%.1f GB", model.mem.wired / gb), dot: blueColor, selected: model.memCard == .system) { model.memCard = .system }
                 TileButton(label: "Comprim.", value: String(format: "%.1f GB", model.mem.compressed / gb), dot: warnColor, selected: model.memCard == .compressed) { model.memCard = .compressed }
-                TileButton(label: "CPU", value: String(format: "%.0f%%", model.cpu * 100), dot: purpleColor, selected: model.memCard == .cpu) { model.memCard = .cpu }
+                TileButton(label: "Disponível", value: gbText(model.mem.free + model.mem.cached), dot: purpleColor, selected: model.memCard == .available) { model.memCard = .available }
             }
             .animation(.easeOut(duration: 0.15), value: model.memCard)
 
@@ -815,6 +930,133 @@ struct MemView: View {
             }
 
             MemDetail(model: model)
+        }
+    }
+}
+
+/// Uma linha da lista de apps por CPU (ícone, nome e %).
+struct CPUAppRow: View {
+    let row: Row
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(nsImage: row.app.icon ?? NSImage()).resizable().frame(width: 22, height: 22)
+            Text(row.app.localizedName ?? "?").font(.system(size: 12.5, weight: .medium)).foregroundStyle(.white).lineLimit(1)
+            Spacer()
+            Text(String(format: "%.0f%%", row.cpu)).font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(muted)
+        }
+        .padding(.vertical, 5).padding(.horizontal, 10)
+    }
+}
+
+struct CPUDetail: View {
+    @ObservedObject var model: Model
+    func stat(_ title: String, _ v: Double) -> some View {
+        VStack(spacing: 2) {
+            Text(String(format: "%.0f%%", v * 100)).font(.system(size: 13, weight: .semibold)).monospacedDigit().foregroundStyle(.white)
+            Text(title).font(.system(size: 10.5)).foregroundStyle(muted)
+        }.frame(maxWidth: .infinity)
+    }
+    func coreRow(_ label: String, _ v: Double) -> some View {
+        HStack(spacing: 8) {
+            Text(label).font(.system(size: 11, weight: .medium)).foregroundStyle(muted).frame(width: 22, alignment: .leading)
+            Bar(fraction: v, height: 6)
+            Text(String(format: "%.0f%%", v * 100)).font(.system(size: 11.5, weight: .medium)).monospacedDigit().foregroundStyle(.white).frame(width: 38, alignment: .trailing)
+        }
+        .padding(.vertical, 3.5).padding(.horizontal, 10)
+    }
+    var body: some View {
+        let n = Double(ProcessInfo.processInfo.activeProcessorCount)
+        VStack(alignment: .leading, spacing: 4) {
+            switch model.cpuCard {
+            case .live:
+                detailHeading("USO NOS ÚLTIMOS 60 S")
+                VStack(alignment: .leading, spacing: 10) {
+                    if model.live.count > 1 {
+                        Spark(values: model.live.map { $0.cpu }, color: purpleColor).frame(height: 120)
+                    } else {
+                        Text("A recolher dados…").font(.system(size: 11)).foregroundStyle(muted).frame(height: 120)
+                    }
+                    HStack {
+                        stat("Usuário", model.userPct)
+                        stat("Sistema", model.sysPct)
+                        stat("Livre", max(1 - model.userPct - model.sysPct, 0))
+                    }
+                }
+                .padding(12).glassCard()
+            case .cores:
+                detailHeading("USO POR NÚCLEO")
+                detailCard {
+                    // os de eficiência vêm primeiro na lista do sistema; mostra os de desempenho no topo
+                    ForEach(0..<perfCores, id: \.self) { i in coreRow("P\(i + 1)", effCores + i < model.cores.count ? model.cores[effCores + i] : 0) }
+                    ForEach(0..<effCores, id: \.self) { i in coreRow("E\(i + 1)", i < model.cores.count ? model.cores[i] : 0) }
+                }
+            case .temp:
+                detailHeading("TEMPERATURAS")
+                if let t = model.temps {
+                    detailCard {
+                        DetailRow(title: "Chip (CPU)", sub: String(format: "Máxima entre os sensores: %.0f °C", t.cpuMax), value: String(format: "%.0f °C", t.cpuAvg), fraction: min(t.cpuAvg / 110, 1))
+                        if let c = t.chips { DetailRow(title: "Outros blocos do chip", sub: "", value: String(format: "%.0f °C", c)) }
+                        if let c = t.ssd { DetailRow(title: "SSD", sub: "", value: String(format: "%.0f °C", c)) }
+                        if let c = t.battery { DetailRow(title: "Bateria", sub: "", value: String(format: "%.0f °C", c)) }
+                    }
+                    let tv = model.live.compactMap { $0.temp }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Chip nos últimos 60 s").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
+                        if tv.count > 1 {
+                            let lo = tv.min()! - 2, hi = max(tv.max()! + 4, lo + 10)
+                            Spark(values: tv.map { ($0 - lo) / (hi - lo) }, color: warnColor).frame(height: 52)
+                        } else {
+                            Text("A recolher dados…").font(.system(size: 11)).foregroundStyle(muted).frame(height: 52)
+                        }
+                    }
+                    .padding(12).glassCard()
+                } else {
+                    detailCard { Text("Este Mac não permite ler os sensores de temperatura.").font(.system(size: 12)).foregroundStyle(muted).padding(12) }
+                }
+            case .load:
+                detailHeading("CARGA MÉDIA")
+                detailCard {
+                    DetailRow(title: "1 · 5 · 15 min", sub: "O Mac tem \(Int(n)) núcleos: acima disso, há fila", value: String(format: "%.1f · %.1f · %.1f", model.load[0], model.load[1], model.load[2]), fraction: model.load[0] / n)
+                }
+                detailHeading("MAIS USAM A CPU")
+                detailCard {
+                    ForEach(Array(model.cpuRows.enumerated()), id: \.offset) { _, r in CPUAppRow(row: r) }
+                    if model.cpuRows.isEmpty { Text("A ler…").font(.system(size: 12)).foregroundStyle(muted).padding(10).frame(maxWidth: .infinity) }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 262, alignment: .topLeading)
+    }
+}
+
+struct CPUView: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        let pct = model.cpu * 100
+        let color: Color = pct >= 75 ? badColor : pct >= 40 ? warnColor : okColor
+        let state = pct >= 75 ? "Uso alto" : pct >= 40 ? "Uso moderado" : "Uso leve"
+        VStack(spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("CPU").font(.system(size: 20, weight: .bold)).tracking(-0.4).foregroundStyle(.white)
+                    HStack(spacing: 6) {
+                        Circle().fill(color).frame(width: 7, height: 7).shadow(color: color, radius: 4)
+                        Text("\(state) · \(ProcessInfo.processInfo.activeProcessorCount) núcleos").font(.system(size: 12, weight: .medium)).foregroundStyle(muted)
+                    }
+                }
+                Spacer()
+            }
+            PctHero(pct: model.heroOn.contains(.cpu) ? pct : 0, color: color, caption: "\(perfCores)P + \(effCores)E")
+                .padding(.vertical, 2)
+                .animation(heroAnim, value: model.heroOn.contains(.cpu))  // só na chegada à aba: animar a cada segundo mantém o painel desenhando sem parar
+            HStack(spacing: 8) {
+                TileButton(label: "Uso", value: String(format: "%.0f%%", pct), dot: purpleColor, selected: model.cpuCard == .live) { model.cpuCard = .live }
+                TileButton(label: "Núcleos", value: "\(perfCores)P·\(effCores)E", dot: okColor, selected: model.cpuCard == .cores) { model.cpuCard = .cores }
+                TileButton(label: "Temp.", value: model.temps.map { "\(Int($0.cpuAvg.rounded()))°" } ?? "—", dot: warnColor, selected: model.cpuCard == .temp) { model.cpuCard = .temp }
+                TileButton(label: "Carga", value: String(format: "%.1f", model.load[0]), dot: blueColor, selected: model.cpuCard == .load) { model.cpuCard = .load }
+            }
+            .animation(.easeOut(duration: 0.15), value: model.cpuCard)
+            CPUDetail(model: model)
         }
     }
 }
@@ -898,12 +1140,12 @@ struct BatView: View {
                     }
                     Spacer()
                 }
-                BatHero(pct: model.heroOn.contains(.bat) ? Double(b.pct) : 0, color: color,
+                PctHero(pct: model.heroOn.contains(.bat) ? Double(b.pct) : 0, color: color,
                         caption: b.charging ? (b.minutes.map { "cheia em \(fmtMin($0))" } ?? "a calcular…")
                             : b.plugged ? (b.pct >= 100 ? "carregada" : "carga em pausa")
                             : (b.minutes.map { "restam \(fmtMin($0))" } ?? "a calcular…"))
                     .padding(.vertical, 2)
-                    .animation(heroAnim, value: model.heroOn.contains(.bat) ? b.pct : 0)
+                    .animation(heroAnim, value: model.heroOn.contains(.bat))
 
                 HStack(spacing: 8) {
                     TileButton(label: b.watts >= 0 ? "A entrar" : "Consumo", value: String(format: "%.0f W", abs(b.watts)), dot: okColor, selected: model.batCard == .power) { model.batCard = .power }
@@ -974,7 +1216,10 @@ struct HealthDetail: View {
             case .thermal:
                 let t = thermalInfo(ProcessInfo.processInfo.thermalState)
                 detailHeading("TEMPERATURA")
-                detailCard { DetailRow(title: "Estado térmico", sub: t.sub, value: t.title) }
+                detailCard {
+                    DetailRow(title: "Estado térmico", sub: t.sub, value: t.title)
+                    if let tp = model.temps { DetailRow(title: "Temperatura do chip", sub: String(format: "Máxima entre os sensores: %.0f °C", tp.cpuMax), value: String(format: "%.0f °C", tp.cpuAvg)) }
+                }
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 12) {
                         Text("Atividade recente").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
@@ -1033,7 +1278,7 @@ struct HealthView: View {
                 TileButton(label: "Disco livre", value: model.diskTotal > 0 ? String(format: "%.0f GB", model.diskFree / gb) : "—", dot: okColor, selected: model.healthCard == .disk) { model.healthCard = .disk }
                 TileButton(label: "SMART", value: model.smart == "Verified" ? "OK" : (model.smart ?? "—"), dot: blueColor, selected: model.healthCard == .smart) { model.healthCard = .smart }
                 TileButton(label: "Ligado há", value: fmtUptime(bootUptime()), dot: warnColor, selected: model.healthCard == .uptime) { model.healthCard = .uptime }
-                TileButton(label: "Térmico", value: thermalInfo(thermal).title, dot: purpleColor, selected: model.healthCard == .thermal) { model.healthCard = .thermal }
+                TileButton(label: "Térmico", value: model.temps.map { "\(Int($0.cpuAvg.rounded()))°" } ?? thermalInfo(thermal).title, dot: purpleColor, selected: model.healthCard == .thermal) { model.healthCard = .thermal }
             }
             .animation(.easeOut(duration: 0.15), value: model.healthCard)
 
@@ -1087,7 +1332,8 @@ struct TabBar: View {
     var body: some View {
         let idx = CGFloat(Tab.allCases.firstIndex(of: model.tab)!)
         GeometryReader { g in
-            let w = (g.size.width - 6 - 4) / 3 // 3 pt de margem de cada lado, 2 pt entre separadores
+            let n = CGFloat(Tab.allCases.count)
+            let w = (g.size.width - 6 - 2 * (n - 1)) / n // 3 pt de margem de cada lado, 2 pt entre separadores
             ZStack(alignment: .leading) {
                 // uma só cápsula que anda de um separador ao outro (não aparece/desaparece)
                 Capsule().fill(Color.white.opacity(0.14))
@@ -1143,6 +1389,7 @@ struct PanelView: View {
     @ViewBuilder func page(_ t: Tab) -> some View {
         switch t {
         case .mem: MemView(model: model)
+        case .cpu: CPUView(model: model)
         case .bat: BatView(model: model)
         case .health: HealthView(model: model)
         }
@@ -1246,13 +1493,14 @@ class Delegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.model.checkUpdate() }
         _ = makePanel() // criar a janela só ao abrir deixa-a em branco no 1.º quadro; os dados é que são lazy
         tick()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
 
         #if DEBUG
         if CommandLine.arguments.contains("--show") {
             if let i = CommandLine.arguments.firstIndex(of: "--tab"), let t = Tab(rawValue: CommandLine.arguments[i + 1]) { model.tab = t }
             if let i = CommandLine.arguments.firstIndex(of: "--bcard"), let c = BatCard(rawValue: CommandLine.arguments[i + 1]) { model.batCard = c }
             if let i = CommandLine.arguments.firstIndex(of: "--hcard"), let c = HealthCard(rawValue: CommandLine.arguments[i + 1]) { model.healthCard = c }
+            if let i = CommandLine.arguments.firstIndex(of: "--ccard"), let c = CPUCard(rawValue: CommandLine.arguments[i + 1]) { model.cpuCard = c }
             if let i = CommandLine.arguments.firstIndex(of: "--card"), let c = MemCard(rawValue: CommandLine.arguments[i + 1]) { model.memCard = c }
             if CommandLine.arguments.contains("--switch") { DispatchQueue.main.asyncAfter(deadline: .now() + 10) { self.model.tab = .health } }
             if CommandLine.arguments.contains("--back") { DispatchQueue.main.asyncAfter(deadline: .now() + 13) { self.model.tab = .mem } }
@@ -1312,10 +1560,11 @@ class Delegate: NSObject, NSApplicationDelegate {
 
     func tick() {
         ticks += 1
-        // fechado: só atualiza o número da barra, de 6 em 6 s
-        if ticks % 8 == 0 { model.record() } // ~16 s
-        if ticks % 1800 == 0 { model.checkUpdate() } // a cada ~1 h tenta; só consulta o GitHub se passaram 12 h
-        if !visible && ticks > 1 && ticks % 3 != 0 { return }
+        if ticks % 16 == 0 { model.record() } // amostra do gráfico: ~16 s
+        if ticks % 3600 == 0 { model.checkUpdate() } // a cada ~1 h tenta; só consulta o GitHub se passaram 12 h
+        // painel aberto na aba CPU: 1×/s (gráficos em tempo real); outras abas: 2 s; fechado: só o número da barra, de 6 em 6 s
+        let step = visible ? (model.tab == .cpu ? 1 : 2) : 6
+        if ticks > 1 && ticks % step != 0 { return }
         model.refresh(visible: visible)
         item.button?.title = String(format: " %.1f GB", model.mem.used / gb)
     }
@@ -1400,6 +1649,12 @@ func selfTest() {
     check(fmtUptime(30 * 3600) == "30 h" && fmtUptime(72 * 3600) == "3 dias" && fmtUptime(600) == "10 min", "fmtUptime")
     check(readMem().total > 0 && readMem().fraction <= 1, "readMem")
     check(readMem().free >= 0 && readMem().swapTotal >= readMem().swapUsed, "free e swap coerentes")
+    check(perfCores + effCores == ProcessInfo.processInfo.activeProcessorCount, "núcleos P + E = total")
+    let cm = CoreMeter(); _ = cm.read(); Thread.sleep(forTimeInterval: 0.2)
+    let r = cm.read()
+    check(r.cores.count == ProcessInfo.processInfo.activeProcessorCount && r.cores.allSatisfy { $0 >= 0 && $0 <= 1 }, "uso por núcleo entre 0 e 1")
+    for _ in 0..<200 { _ = thermals.read() } // leituras seguidas não podem derrubar o app (cliente dos sensores)
+    if let t = thermals.read() { check(t.cpuAvg > 15 && t.cpuAvg < 110 && t.cpuMax >= t.cpuAvg, "temperatura plausível") } // nil = sem sensores: tudo bem
     // duas leituras de CPU não se atrapalham: o `b.read()` do meio não pode encurtar a janela de `a`
     let a = CPUMeter(), b = CPUMeter()
     _ = a.read(); _ = b.read()

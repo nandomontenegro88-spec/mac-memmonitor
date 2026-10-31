@@ -1,9 +1,15 @@
 # MemMonitor
 
-Medidor de **memória, bateria e saúde** do Mac na barra de menu. Clica no ícone da RAM e abre um painel com três abas:
-**Memória** (anel, botão Fechar e Liberar memória), **Bateria** (percentual, potência, carregador, saúde, ciclos e modo de pouca energia)
-e **Saúde** (selo geral, disco, SMART, tempo ligado com itens de início, temperatura e rede).
-Nas três abas, os **quatro cards abaixo do anel são clicáveis**: o selecionado mostra os detalhes por baixo.
+Medidor de **memória, CPU, bateria e saúde** do Mac na barra de menu. Clica no ícone da RAM e abre um painel com quatro abas:
+
+- **Memória**: anel de uso, botão Fechar nos apps e Liberar memória.
+- **CPU**: uso total e por núcleo (desempenho e eficiência), gráfico dos últimos 60 s, **temperaturas** do chip, SSD e bateria, carga média e os apps que mais usam CPU.
+- **Bateria**: percentual, potência, carregador, saúde, ciclos e modo de pouca energia.
+- **Saúde**: selo geral, disco, SMART, tempo ligado com itens de início, temperatura e rede.
+
+Em cada aba, os **quatro cards abaixo do anel são clicáveis**: o selecionado mostra os detalhes por baixo.
+
+> As temperaturas vêm de leituras internas do macOS para chips Apple, sem API oficial. Se um dia o macOS mudar isso, o app continua a funcionar e só mostra «—» nas temperaturas.
 
 Requisitos: Mac com **chip Apple** (M1 ou mais novo) e **macOS 14+**.
 
