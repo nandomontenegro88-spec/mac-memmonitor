@@ -104,6 +104,32 @@ func sh(_ exe: String, _ args: [String]) -> Data {
     return d
 }
 
+func ok(_ exe: String, _ args: [String]) -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    p.standardOutput = Pipe(); p.standardError = Pipe()
+    guard (try? p.run()) != nil else { return false }
+    p.waitUntilExit()
+    return p.terminationStatus == 0
+}
+
+// MARK: - Atualizações (releases do GitHub)
+
+let repoSlug = "nandomontenegro88-spec/mac-memmonitor"
+let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0"
+
+struct Update { var version: String; var url: URL }
+
+func versionGreater(_ a: String, than b: String) -> Bool {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) {
+        let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+        if p != q { return p > q }
+    }
+    return false
+}
+
 func shText(_ exe: String, _ args: [String]) -> String { String(decoding: sh(exe, args), as: UTF8.self) }
 
 struct Batt {
@@ -190,6 +216,9 @@ final class Model: ObservableObject {
     @Published var up = 0.0
     @Published var loginItems: [String] = []
     @Published var loginNote: String?
+    @Published var update: Update?
+    @Published var updateState = ""
+    private var lastUpdateCheck = Date.distantPast
 
     private var lastNet: (d: Double, u: Double, t: Date)?
     private var slowStamps: [Tab: Date] = [:]
@@ -272,6 +301,59 @@ final class Model: ObservableObject {
                     self.loginItems = items ?? []
                 }
             }
+        }
+    }
+
+    /// Pergunta ao GitHub qual é a última release (no máx. 1× a cada 12 h). Não envia nada do Mac.
+    func checkUpdate() {
+        guard Date().timeIntervalSince(lastUpdateCheck) > 12 * 3600 else { return }
+        lastUpdateCheck = Date()
+        let args = CommandLine.arguments
+        let override = args.firstIndex(of: "--update-url").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } // só para testes
+        guard let api = URL(string: override ?? "https://api.github.com/repos/\(repoSlug)/releases/latest") else { return }
+        var req = URLRequest(url: api)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 15
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let tag = j["tag_name"] as? String else { return }
+            let v = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            guard versionGreater(v, than: currentVersion),
+                  let assets = j["assets"] as? [[String: Any]],
+                  let a = assets.first(where: { ($0["name"] as? String) == "MemMonitor.zip" }),
+                  let s = a["browser_download_url"] as? String, let u = URL(string: s),
+                  override != nil || ["github.com", "objects.githubusercontent.com"].contains(u.host ?? "") else { return }
+            DispatchQueue.main.async {
+                self.update = Update(version: v, url: u)
+                if CommandLine.arguments.contains("--auto-update") { self.installUpdate() } // só para testes
+            }
+        }.resume()
+    }
+
+    /// Baixa, confere (identificador, versão, assinatura), troca o app e reabre. Falhou algo: o app atual fica intacto.
+    func installUpdate() {
+        guard let up = update, updateState != "A atualizar…" else { return }
+        updateState = "A atualizar…"
+        DispatchQueue.global().async {
+            func fail(_ m: String) { DispatchQueue.main.async { self.updateState = "Não deu: \(m)" } }
+            guard let data = try? Data(contentsOf: up.url) else { return fail("sem ligação") }
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("memmonitor-update-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            let zip = tmp.appendingPathComponent("MemMonitor.zip")
+            guard (try? data.write(to: zip)) != nil, ok("/usr/bin/ditto", ["-x", "-k", zip.path, tmp.appendingPathComponent("out").path]) else { return fail("pacote inválido") }
+            let app = tmp.appendingPathComponent("out/MemMonitor.app")
+            let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
+            guard info?["CFBundleIdentifier"] as? String == "local.memmonitor",
+                  let nv = info?["CFBundleShortVersionString"] as? String, versionGreater(nv, than: currentVersion) else { return fail("versão inesperada") }
+            guard ok("/usr/bin/codesign", ["--verify", app.path]) else { return fail("assinatura não confere") }
+            let dest = Bundle.main.bundleURL.path
+            guard FileManager.default.isWritableFile(atPath: (dest as NSString).deletingLastPathComponent) else { return fail("sem permissão na pasta") }
+            // espera este processo sair; copia ao lado e só então troca (nunca fica sem app)
+            let script = "while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.2; done; /usr/bin/ditto \"$2\" \"$1.new\" && rm -rf \"$1\" && mv \"$1.new\" \"$1\"; /usr/bin/xattr -cr \"$1\"; open \"$1\"; rm -rf \"$3\""
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = ["-c", script, "sh", dest, app.path, tmp.path]
+            guard (try? p.run()) != nil else { return fail("não consegui trocar") }
+            DispatchQueue.main.async { NSApp.terminate(nil) }
         }
     }
 
@@ -868,10 +950,28 @@ struct PanelView: View {
             .clipped()
             .padding(.horizontal, -18)
             .enter(model, 1)
+            if let u = model.update {
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.down.circle.fill").font(.system(size: 20)).foregroundStyle(okColor)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Nova versão \(u.version)").font(.system(size: 12.5, weight: .semibold)).foregroundStyle(.white)
+                        Text(model.updateState.isEmpty ? "Você tem a \(currentVersion)" : model.updateState)
+                            .font(.system(size: 11)).foregroundStyle(muted).lineLimit(1)
+                    }
+                    Spacer()
+                    Button("Atualizar") { model.installUpdate() }
+                        .buttonStyle(Press(fill: okColor, solid: false)).frame(width: 90)
+                        .disabled(model.updateState == "A atualizar…")
+                }
+                .padding(10).glassCard()
+            }
+
             HStack {
                 FootLink(icon: "chart.bar.xaxis", title: "Monitor de Atividade") {
                     NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"))
                 }
+                Spacer()
+                Text("v\(currentVersion)").font(.system(size: 11)).foregroundStyle(muted.opacity(0.7))
                 Spacer()
                 FootLink(icon: "power", title: "Sair") { NSApp.terminate(nil) }
             }
@@ -918,6 +1018,7 @@ class Delegate: NSObject, NSApplicationDelegate {
         item.button?.image = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "Memória")
         item.button?.imagePosition = .imageLeading
         model.prefetch()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.model.checkUpdate() }
         _ = makePanel() // criar a janela só ao abrir deixa-a em branco no 1.º quadro; os dados é que são lazy
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
@@ -971,6 +1072,7 @@ class Delegate: NSObject, NSApplicationDelegate {
         model.$rows.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.resize() }.store(in: &bag)
         model.$batt.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.resize() }.store(in: &bag)
         model.$loginItems.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.resize() }.store(in: &bag)
+        model.$update.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.resize() }.store(in: &bag)
         // trocar de aba: o conteúdo antigo sai, o novo entra em cascata
         model.$tab.dropFirst().sink { [weak self] t in
             guard let self else { return }
@@ -991,6 +1093,7 @@ class Delegate: NSObject, NSApplicationDelegate {
         ticks += 1
         // fechado: só atualiza o número da barra, de 6 em 6 s
         if ticks % 8 == 1 { model.record() }
+        if ticks % 1800 == 0 { model.checkUpdate() } // a cada ~1 h tenta; só consulta o GitHub se passaram 12 h
         if !visible && ticks > 1 && ticks % 3 != 0 { return }
         model.refresh(visible: visible)
         item.button?.title = String(format: " %.1f GB", model.mem.used / gb)

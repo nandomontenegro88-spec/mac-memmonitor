@@ -20,6 +20,12 @@ No fim ele pergunta se queres tirar o pedido de senha do botão **Liberar memór
 
 > Antes de rodar qualquer `curl | bash`, vale ler o script: [`install.sh`](install.sh).
 
+## Atualizações dentro do app
+
+A partir da **versão 1.1** o app confere sozinho se há versão nova (ao abrir e a cada 12 h). Quando houver, aparece uma faixa verde no painel
+com o botão **Atualizar**: ele baixa a release, confere o identificador, a versão e a assinatura, troca o app e reabre.
+Se algo não confere, o app atual fica como está. Quem ainda estiver na 1.0 precisa rodar a linha de instalação acima **uma vez**.
+
 ## Sem pedir senha no "Liberar memória" (opcional)
 
 O `purge` só roda como administrador. O `tirar-senha.sh` cria uma regra que libera **só esse comando**:
@@ -36,7 +42,7 @@ O **modo de pouca energia** continua pedindo a senha sempre, de propósito.
 - *Liberar memória* esvazia só o cache de arquivos; o macOS volta a enchê-lo. O que baixa o uso de verdade é fechar apps pesados.
 - Os gráficos guardam ~2 h e começam vazios sempre que o app abre.
 - Na aba Saúde, o macOS pode perguntar se o app pode controlar o *System Events* (para listar os itens de início).
-- O app não envia nada para a internet.
+- A única conexão do app é perguntar ao GitHub qual é a última versão (no máximo a cada 12 h); não envia nada do seu Mac.
 
 ## Desinstalar
 
