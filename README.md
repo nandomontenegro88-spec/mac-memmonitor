@@ -1,6 +1,6 @@
 # MemMonitor
 
-Medidor de **memória, CPU, bateria e saúde** do Mac na barra de menu. Clica no ícone da RAM e abre um painel com quatro abas:
+Medidor de **memória, CPU, bateria e saúde** do Mac na barra de menu. Na barra de menu aparece um **arco com a memória livre** e o número de GB livres (a cor do arco segue a pressão da memória). Clica nele e abre um painel com quatro abas:
 
 - **Memória**: anel de uso, botão Fechar nos apps e Liberar memória.
 - **CPU**: uso total e por núcleo (desempenho e eficiência), gráfico dos últimos 60 s, **temperaturas** do chip, SSD e bateria, carga média e os apps que mais usam CPU.

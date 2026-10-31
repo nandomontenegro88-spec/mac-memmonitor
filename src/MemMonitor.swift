@@ -640,6 +640,26 @@ func pressureInfo(_ p: Int) -> (String, Color) {
     p >= 4 ? ("Memória sob pressão", badColor) : p == 2 ? ("Memória a ficar cheia", warnColor) : ("Tudo certo com a memória", okColor)
 }
 
+/// Ícone da barra de menu: arco de 270° (aberto em baixo) que mostra a memória livre.
+/// A cor segue a pressão da memória; a pista usa a cor do texto, por isso funciona em tema claro e escuro.
+func gaugeImage(fraction: Double, pressure: Int) -> NSImage {
+    let color: NSColor = pressure >= 4 ? .systemRed : pressure == 2 ? .systemOrange : .systemGreen
+    let f = CGFloat(min(max(fraction, 0), 1))
+    let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+        func arc(_ from: CGFloat, _ to: CGFloat, _ col: NSColor) {
+            let p = NSBezierPath()
+            p.appendArc(withCenter: NSPoint(x: 9, y: 9), radius: 6.4, startAngle: from, endAngle: to, clockwise: true)
+            p.lineWidth = 2.4; p.lineCapStyle = .round
+            col.setStroke(); p.stroke()
+        }
+        arc(225, -45, NSColor.labelColor.withAlphaComponent(0.28)) // pista: de baixo-esquerda, por cima, até baixo-direita
+        if f > 0.015 { arc(225, 225 - 270 * f, color) }
+        return true
+    }
+    img.isTemplate = false
+    return img
+}
+
 struct Ring: View {
     var fraction: Double
     var color: Color
@@ -1483,6 +1503,7 @@ class Delegate: NSObject, NSApplicationDelegate {
     var bag = Set<AnyCancellable>()
     var ticks = 0
     var prevTab = Tab.mem
+    var lastIcon = ""
     var visible: Bool { panel?.isVisible ?? false }
     #if DEBUG
     var testing: Bool { CommandLine.arguments.contains("--show") }
@@ -1494,12 +1515,13 @@ class Delegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         #if DEBUG
         if CommandLine.arguments.contains("--selftest") { selfTest() }
+        if let i = CommandLine.arguments.firstIndex(of: "--iconsheet"), i + 1 < CommandLine.arguments.count { iconSheet(CommandLine.arguments[i + 1]) }
         #endif
         _ = panelCPU.read(); _ = historyCPU.read() // primeira leitura só marca o ponto de partida
         item.button?.target = self
         item.button?.action = #selector(toggle)
-        item.button?.image = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "Memória")
         item.button?.imagePosition = .imageLeading
+        updateStatusItem()
         model.prefetch()
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.model.checkUpdate() }
         _ = makePanel() // criar a janela só ao abrir deixa-a em branco no 1.º quadro; os dados é que são lazy
@@ -1515,7 +1537,7 @@ class Delegate: NSObject, NSApplicationDelegate {
             if let i = CommandLine.arguments.firstIndex(of: "--card"), let c = MemCard(rawValue: CommandLine.arguments[i + 1]) { model.memCard = c }
             if CommandLine.arguments.contains("--switch") { DispatchQueue.main.asyncAfter(deadline: .now() + 10) { self.model.tab = .health } }
             if CommandLine.arguments.contains("--back") { DispatchQueue.main.asyncAfter(deadline: .now() + 13) { self.model.tab = .mem } }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.toggle() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.toggle(); if let f = self.item.button?.window?.frame { print("BAR", Int(f.minX), Int(NSScreen.screens[0].frame.height - f.maxY), Int(f.width), Int(f.height)); fflush(stdout) } }
         }
         #endif
     }
@@ -1569,6 +1591,21 @@ class Delegate: NSObject, NSApplicationDelegate {
         return p
     }
 
+    /// Barra de menu: arco com a memória livre e o número de GB livres (total − usada). Só redesenha o arco quando muda de verdade.
+    func updateStatusItem() {
+        let m = model.mem
+        let free = max(m.total - m.used, 0)
+        item.button?.title = String(format: " %.1f GB", free / gb)
+        let key = "\(Int(free / m.total * 40))-\(m.pressure)"
+        if key != lastIcon {
+            lastIcon = key
+            item.button?.image = gaugeImage(fraction: free / m.total, pressure: m.pressure)
+            item.button?.imagePosition = .imageLeading
+        }
+        item.button?.toolTip = String(format: "Memória livre: %.1f GB de %.0f GB (em uso: %.1f GB)", free / gb, m.total / gb, m.used / gb)
+        item.button?.setAccessibilityLabel("Memória livre")
+    }
+
     func tick() {
         ticks += 1
         if ticks % 16 == 0 { model.record() } // amostra do gráfico: ~16 s
@@ -1577,7 +1614,7 @@ class Delegate: NSObject, NSApplicationDelegate {
         let step = visible ? (model.tab == .cpu ? 1 : 2) : 6
         if ticks > 1 && ticks % step != 0 { return }
         model.refresh(visible: visible)
-        item.button?.title = String(format: " %.1f GB", model.mem.used / gb)
+        updateStatusItem()
     }
 
     func resize() {
@@ -1641,6 +1678,28 @@ class Delegate: NSObject, NSApplicationDelegate {
 }
 
 #if DEBUG
+/// Desenha o arco em vários estados, em fundo claro e escuro, ampliado: só para ver o resultado sem fotografar a barra de verdade.
+func iconSheet(_ path: String) {
+    let states: [(Double, Int)] = [(0.85, 1), (0.55, 1), (0.28, 1), (0.14, 2), (0.05, 4)]
+    let scale: CGFloat = 8, cell = 18 * scale + 40
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(cell) * states.count, pixelsHigh: Int(cell) * 2, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    for (row, dark) in [false, true].enumerated() {
+        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
+        for (col, st) in states.enumerated() {
+            let r = NSRect(x: CGFloat(col) * cell, y: CGFloat(1 - row) * cell, width: cell, height: cell)
+            (dark ? NSColor(white: 0.16, alpha: 1) : NSColor(white: 0.93, alpha: 1)).setFill(); r.fill()
+            appearance.performAsCurrentDrawingAppearance {
+                gaugeImage(fraction: st.0, pressure: st.1).draw(in: NSRect(x: r.minX + 20, y: r.minY + 20, width: 18 * scale, height: 18 * scale))
+            }
+        }
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    print("sheet ok"); exit(0)
+}
+
 /// `swiftc -DDEBUG …` e `./MemMonitor --selftest` (veja tests/run.sh)
 func selfTest() {
     var fails = 0
