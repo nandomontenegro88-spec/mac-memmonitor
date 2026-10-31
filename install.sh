@@ -35,8 +35,8 @@ echo "Instalado em $DEST/MemMonitor.app"
 open "$DEST/MemMonitor.app"
 
 # passo opcional: o botão "Liberar memória" sem pedir a senha (precisa do /dev/tty porque o script vem por pipe)
-if [ -r /dev/tty ] && ! sudo -n /usr/sbin/purge >/dev/null 2>&1; then
-  printf "Quer que o botão 'Liberar memória' pare de pedir a senha? (só libera o comando purge) [s/N] " > /dev/tty
+if [ -r /dev/tty ] && ! sudo -n -l /usr/bin/pmset -a lowpowermode 0 >/dev/null 2>&1; then
+  printf "Quer que 'Liberar memória' e o modo de pouca energia parem de pedir a senha? (só libera 3 comandos exatos) [s/N] " > /dev/tty
   read -r ans < /dev/tty || ans=""
   if [ "$ans" = "s" ] || [ "$ans" = "S" ]; then
     # o script vem da versão que acabou de ser instalada (a tag), não da branch main: o que corre com sudo não muda por baixo

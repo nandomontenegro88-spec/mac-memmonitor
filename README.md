@@ -26,16 +26,16 @@ A partir da **versão 1.1** o app confere sozinho se há versão nova (ao abrir 
 com o botão **Atualizar**: ele baixa a release, confere o identificador, a versão e a assinatura, troca o app e reabre.
 Se algo não confere, o app atual fica como está. Quem ainda estiver na 1.0 precisa rodar a linha de instalação acima **uma vez**.
 
-## Sem pedir senha no "Liberar memória" (opcional)
+## Sem pedir senha (opcional)
 
-O `purge` só roda como administrador. O `tirar-senha.sh` cria uma regra que libera **só esse comando**:
+O botão **Liberar memória** (`purge`) e o interruptor do **modo de pouca energia** (`pmset`) só rodam como administrador. O `tirar-senha.sh` cria uma regra que libera **só estes 3 comandos exatos**: `purge`, `pmset -a lowpowermode 0` e `pmset -a lowpowermode 1`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nandomontenegro88-spec/mac-memmonitor/main/tirar-senha.sh | bash
 ```
 
 Para desfazer: `sudo rm /etc/sudoers.d/memmonitor`.
-O **modo de pouca energia** continua pedindo a senha sempre, de propósito.
+Quem já tinha rodado o script na 1.0 precisa rodar **de novo** uma vez, para incluir o modo de pouca energia.
 
 ## Bom saber
 

@@ -425,11 +425,13 @@ final class Model: ObservableObject {
         }
     }
 
-    /// O modo de pouca energia só muda com administrador, por isso pede a palavra-passe do Mac.
+    /// O modo de pouca energia só muda com administrador: sem senha se existir a regra do `tirar-senha.sh`, senão pede ao macOS.
     func setLowPower(_ on: Bool) {
         lowPower = on
         DispatchQueue.global().async {
-            sh("/usr/bin/osascript", ["-e", "do shell script \"/usr/bin/pmset -a lowpowermode \(on ? 1 : 0)\" with administrator privileges"])
+            let v = on ? "1" : "0"
+            _ = ok("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "lowpowermode", v])
+                || ok("/usr/bin/osascript", ["-e", "do shell script \"/usr/bin/pmset -a lowpowermode \(v)\" with administrator privileges"])
             let real = lowPowerOn(shText("/usr/bin/pmset", ["-g"]))
             DispatchQueue.main.async { self.lowPower = real }
         }
@@ -846,7 +848,7 @@ struct BatView: View {
                     Image(systemName: "leaf.fill").foregroundStyle(okColor).frame(width: 22)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Modo de pouca energia").font(.system(size: 13, weight: .medium)).foregroundStyle(.white)
-                        Text("Poupa bateria; pede a palavra-passe").font(.system(size: 11)).foregroundStyle(muted)
+                        Text("Poupa bateria e esquenta menos").font(.system(size: 11)).foregroundStyle(muted)
                     }
                     Spacer()
                     Toggle("", isOn: Binding(get: { model.lowPower }, set: { model.setLowPower($0) }))
