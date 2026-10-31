@@ -24,8 +24,9 @@ sudo visudo -cf "$TMP"
 sudo install -m 440 -o root -g wheel "$TMP" "$REGRA"
 rm -f "$TMP"
 
-# confirma que funciona (sem mudar nada: `sudo -l` só pergunta se o comando é permitido)
-if sudo -n /usr/sbin/purge && sudo -n -l /usr/bin/pmset -a lowpowermode 0 >/dev/null 2>&1 && sudo -n -l /usr/bin/pmset -a lowpowermode 1 >/dev/null 2>&1; then
+# confirma que funciona: lê a lista de regras (`sudo -l` sobre um comando dá falso positivo para quem é administrador)
+sudo -k
+if sudo -n /usr/sbin/purge && sudo -n -l 2>/dev/null | grep -q "NOPASSWD:.*lowpowermode 0" && sudo -n -l 2>/dev/null | grep -q "NOPASSWD:.*lowpowermode 1"; then
   echo "Pronto: 'Liberar memória' e o modo de pouca energia já não pedem a senha."
 else
   echo "A regra foi instalada, mas o teste falhou. Corre 'bash tirar-senha.sh desfazer' e tenta de novo."
