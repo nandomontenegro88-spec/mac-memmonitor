@@ -142,7 +142,8 @@ func lowPowerOn(_ pmset: String) -> Bool {
 func shText(_ exe: String, _ args: [String]) -> String { String(decoding: sh(exe, args), as: UTF8.self) }
 
 struct Batt: Equatable {
-    var pct = 0, cycles = 0, adapterW = 0
+    var pct = 0, cycles = 0, adapterW = 0, designmAh = 0, nominalmAh = 0
+    var volts = 0.0, amps = 0.0, adapterV = 0.0, adapterA = 0.0
     var charging = false, plugged = false
     var minutes: Int?
     var watts = 0.0   // + a entrar na bateria, − a sair
@@ -159,7 +160,17 @@ func readBattery() -> Batt? {
     t.plugged = (b["ExternalConnected"] as? Bool) ?? false
     let amp = Int64(bitPattern: (b["InstantAmperage"] as? NSNumber)?.uint64Value ?? 0)
     t.watts = Double(amp) * Double(i("Voltage")) / 1e6
-    if let ad = b["AdapterDetails"] as? [String: Any] { t.adapterW = (ad["Watts"] as? NSNumber)?.intValue ?? 0 }
+    t.volts = Double(i("Voltage")) / 1000
+    t.amps = Double(amp) / 1000
+    if let bd = b["BatteryData"] as? [String: Any] {
+        t.designmAh = (bd["DesignCapacity"] as? NSNumber)?.intValue ?? 0
+        t.nominalmAh = (bd["NominalChargeCapacity"] as? NSNumber)?.intValue ?? 0
+    }
+    if let ad = b["AdapterDetails"] as? [String: Any] {
+        t.adapterW = (ad["Watts"] as? NSNumber)?.intValue ?? 0
+        t.adapterV = Double((ad["AdapterVoltage"] as? NSNumber)?.intValue ?? 0) / 1000
+        t.adapterA = Double((ad["Current"] as? NSNumber)?.intValue ?? 0) / 1000
+    }
     let m = t.charging ? i("AvgTimeToFull") : i("TimeRemaining")
     t.minutes = (m > 0 && m < 65535) ? m : nil // 65535 = ainda a calcular
     return t
@@ -199,6 +210,18 @@ struct Sample { var mem: Double; var cpu: Double; var batt: Double? }
 /// Os 4 cards abaixo do anel da Memória: o selecionado mostra os detalhes por baixo.
 enum MemCard: String, CaseIterable { case apps, system, compressed, cpu }
 
+enum BatCard: String, CaseIterable { case power, charger, health, cycles }
+enum HealthCard: String, CaseIterable { case disk, smart, uptime, thermal }
+
+func thermalInfo(_ t: ProcessInfo.ThermalState) -> (title: String, sub: String) {
+    switch t {
+    case .nominal: return ("Normal", "Sem aquecimento")
+    case .fair: return ("Morno", "O Mac está a aquecer um pouco")
+    case .serious: return ("Quente", "O macOS já reduz a velocidade")
+    default: return ("Muito quente", "Fecha apps pesados e deixa arrefecer")
+    }
+}
+
 enum Tab: String, CaseIterable { case mem = "Memória", bat = "Bateria", health = "Saúde" }
 
 // MARK: - Modelo
@@ -206,6 +229,10 @@ enum Tab: String, CaseIterable { case mem = "Memória", bat = "Bateria", health 
 final class Model: ObservableObject {
     @Published var tab = Tab.mem
     @Published var memCard = MemCard.apps
+    @Published var batCard = BatCard.power
+    @Published var healthCard = HealthCard.disk
+    @Published var diskModel: String?
+    @Published var diskSolid: Bool?
     @Published var heroOn: Set<Tab> = []   // abas cujo anel/número já «subiram»: ao voltar a uma aba, a animação repete
     @Published var shown = false   // painel aberto: dispara a entrada animada
     @Published var mem = readMem()
@@ -314,11 +341,14 @@ final class Model: ObservableObject {
                 pct = Int((h["sppower_battery_health_maximum_capacity"] as? String ?? "").replacingOccurrences(of: "%", with: ""))
                 word = h["sppower_battery_health"] as? String
             }
-            var lp: Bool?, smart: String?, v: URLResourceValues?, items: [String]?
+            var lp: Bool?, smart: String?, dModel: String?, dSolid: Bool?, v: URLResourceValues?, items: [String]?
             if tab == .bat { lp = lowPowerOn(shText("/usr/bin/pmset", ["-g"])) }
             if tab == .health {
-                smart = shText("/usr/sbin/diskutil", ["info", "/"]).split(separator: "\n")
-                    .first { $0.contains("SMART Status") }?.split(separator: ":").last.map { $0.trimmingCharacters(in: .whitespaces) }
+                func field(_ text: String, _ k: String) -> String? {
+                    text.split(separator: "\n").first { $0.contains(k) }?.split(separator: ":", maxSplits: 1).last.map { $0.trimmingCharacters(in: .whitespaces) }
+                }
+                let root = shText("/usr/sbin/diskutil", ["info", "/"]), disk = shText("/usr/sbin/diskutil", ["info", "disk0"]) // o modelo só aparece no disco físico
+                smart = field(root, "SMART Status"); dSolid = field(root, "Solid State").map { $0 == "Yes" }; dModel = field(disk, "Device / Media Name")
                 v = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
                 // um nome por linha: nomes com vírgula não se partem em dois
                 items = shText("/usr/bin/osascript", ["-e", "tell application \"System Events\" to set n to name of every login item",
@@ -330,7 +360,7 @@ final class Model: ObservableObject {
                 self.healthPct = pct; self.healthWord = word
                 if let lp { self.lowPower = lp }
                 if tab == .health {
-                    self.smart = smart
+                    self.smart = smart; self.diskModel = dModel; self.diskSolid = dSolid
                     self.diskFree = Double(v?.volumeAvailableCapacityForImportantUsage ?? 0)
                     self.diskTotal = Double(v?.volumeTotalCapacity ?? 0)
                     self.loginItems = items ?? []
@@ -516,6 +546,23 @@ struct Tile: View {
     }
 }
 
+/// Card clicável (as três abas usam o mesmo): o selecionado ganha contorno na cor dele.
+struct TileButton: View {
+    var label: String, value: String, dot: Color, selected: Bool
+    var action: () -> Void
+    var body: some View {
+        Button(action: action) { Tile(label: label, value: value, dot: dot, selected: selected) }.buttonStyle(TilePress())
+    }
+}
+
+/// Título pequeno e caixa de vidro dos detalhes que aparecem por baixo dos cards.
+func detailHeading(_ t: String) -> some View {
+    Text(t).font(.system(size: 10.5, weight: .semibold)).tracking(0.7).foregroundStyle(muted).padding(.horizontal, 10)
+}
+func detailCard<C: View>(@ViewBuilder _ c: () -> C) -> some View {
+    VStack(spacing: 0) { c() }.padding(.vertical, 4).glassCard()
+}
+
 /// feedback instantâneo ao premir um card
 struct TilePress: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
@@ -688,29 +735,29 @@ struct MemDetail: View {
         VStack(alignment: .leading, spacing: 4) {
             switch model.memCard {
             case .apps:
-                heading("APPS QUE MAIS USAM")
+                detailHeading("APPS QUE MAIS USAM")
                 let mx = model.rows.first?.bytes ?? 1
-                card { ForEach(Array(model.rows.enumerated()), id: \.offset) { _, r in AppRow(row: r, maxBytes: mx) } }
+                detailCard { ForEach(Array(model.rows.enumerated()), id: \.offset) { _, r in AppRow(row: r, maxBytes: mx) } }
             case .system:
-                heading("O QUE O SISTEMA USA")
-                card {
+                detailHeading("O QUE O SISTEMA USA")
+                detailCard {
                     DetailRow(title: "Sistema (fixa)", sub: "Kernel e drivers: não dá para liberar", value: gbText(m.wired), fraction: m.wired / m.total)
                     DetailRow(title: "Cache de arquivos", sub: "O macOS libera sozinho quando precisa", value: gbText(m.cached), fraction: m.cached / m.total)
                     DetailRow(title: "Livre", sub: "Sem nenhum uso agora", value: gbText(m.free), fraction: m.free / m.total)
                 }
             case .compressed:
-                heading("MEMÓRIA COMPRIMIDA")
-                card {
+                detailHeading("MEMÓRIA COMPRIMIDA")
+                detailCard {
                     DetailRow(title: "Comprimida agora", sub: "Espaço que ocupa na RAM", value: gbText(m.compressed), fraction: m.compressed / m.total)
                     DetailRow(title: "Equivale a", sub: "O que ocuparia sem compressão", value: gbText(m.uncompressed), fraction: m.uncompressed / m.total)
                     DetailRow(title: "Economia", sub: "RAM poupada pela compressão", value: gbText(max(m.uncompressed - m.compressed, 0)), fraction: max(m.uncompressed - m.compressed, 0) / m.total)
                     DetailRow(title: "Swap em disco", sub: "Só entra quando comprimir não basta", value: gbText(m.swapUsed), fraction: m.swapTotal > 0 ? m.swapUsed / m.swapTotal : 0)
                 }
             case .cpu:
-                heading("MAIS USAM A CPU")
+                detailHeading("MAIS USAM A CPU")
                 var load = [0.0, 0.0, 0.0]
                 let _ = getloadavg(&load, 3)
-                card {
+                detailCard {
                     ForEach(Array(model.cpuRows.enumerated()), id: \.offset) { _, r in
                         HStack(spacing: 10) {
                             Image(nsImage: r.app.icon ?? NSImage()).resizable().frame(width: 22, height: 22)
@@ -727,19 +774,10 @@ struct MemDetail: View {
         }
         .frame(maxWidth: .infinity, minHeight: 244, alignment: .topLeading)
     }
-    func heading(_ t: String) -> some View {
-        Text(t).font(.system(size: 10.5, weight: .semibold)).tracking(0.7).foregroundStyle(muted).padding(.horizontal, 10)
-    }
-    func card<C: View>(@ViewBuilder _ c: () -> C) -> some View {
-        VStack(spacing: 0) { c() }.padding(.vertical, 4).glassCard()
-    }
 }
 
 struct MemView: View {
     @ObservedObject var model: Model
-    func card(_ c: MemCard, _ label: String, _ value: String, _ dot: Color) -> some View {
-        Button { model.memCard = c } label: { Tile(label: label, value: value, dot: dot, selected: model.memCard == c) }.buttonStyle(TilePress())
-    }
     var body: some View {
         let (title, color) = pressureInfo(model.mem.pressure)
         VStack(spacing: 14) {
@@ -759,10 +797,10 @@ struct MemView: View {
             .padding(.vertical, 2)
 
             HStack(spacing: 8) {
-                card(.apps, "Apps", String(format: "%.1f GB", model.mem.app / gb), okColor)
-                card(.system, "Sistema", String(format: "%.1f GB", model.mem.wired / gb), blueColor)
-                card(.compressed, "Comprim.", String(format: "%.1f GB", model.mem.compressed / gb), warnColor)
-                card(.cpu, "CPU", String(format: "%.0f%%", model.cpu * 100), purpleColor)
+                TileButton(label: "Apps", value: String(format: "%.1f GB", model.mem.app / gb), dot: okColor, selected: model.memCard == .apps) { model.memCard = .apps }
+                TileButton(label: "Sistema", value: String(format: "%.1f GB", model.mem.wired / gb), dot: blueColor, selected: model.memCard == .system) { model.memCard = .system }
+                TileButton(label: "Comprim.", value: String(format: "%.1f GB", model.mem.compressed / gb), dot: warnColor, selected: model.memCard == .compressed) { model.memCard = .compressed }
+                TileButton(label: "CPU", value: String(format: "%.0f%%", model.cpu * 100), dot: purpleColor, selected: model.memCard == .cpu) { model.memCard = .cpu }
             }
             .animation(.easeOut(duration: 0.15), value: model.memCard)
 
@@ -778,6 +816,66 @@ struct MemView: View {
 
             MemDetail(model: model)
         }
+    }
+}
+
+struct BatDetail: View {
+    @ObservedObject var model: Model
+    var b: Batt
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            switch model.batCard {
+            case .power:
+                let hasAdapter = b.plugged && b.adapterW > 0
+                detailHeading(b.watts >= 0 ? "ENERGIA A ENTRAR" : "CONSUMO AGORA")
+                detailCard {
+                    DetailRow(title: b.watts >= 0 ? "Potência a entrar" : "Potência de consumo",
+                              sub: hasAdapter ? "De \(b.adapterW) W do carregador" : "O que a bateria gasta agora",
+                              value: String(format: "%.0f W", abs(b.watts)), fraction: hasAdapter ? max(b.watts, 0) / Double(b.adapterW) : nil)
+                    DetailRow(title: "Tensão da bateria", sub: String(format: "Corrente de %.2f A", abs(b.amps)), value: String(format: "%.1f V", b.volts))
+                }
+                let bv = model.history.compactMap { $0.batt }
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Bateria desde que o app abriu").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
+                        Spacer()
+                        if let f = bv.first, let l = bv.last, bv.count > 1 {
+                            Text(String(format: "%+.0f%%", l - f)).font(.system(size: 12)).monospacedDigit().foregroundStyle(muted)
+                        }
+                    }
+                    if bv.count > 1 {
+                        let lo = bv.min()!, hi = max(bv.max()!, lo + 10) // escala ajustada para variações pequenas aparecerem
+                        Spark(values: bv.map { ($0 - lo) / (hi - lo) }, color: okColor).frame(height: 34)
+                    } else {
+                        Text("A recolher dados…").font(.system(size: 11)).foregroundStyle(muted).frame(height: 34)
+                    }
+                }
+                .padding(12).glassCard()
+            case .charger:
+                detailHeading("CARREGADOR")
+                detailCard {
+                    DetailRow(title: "Potência máxima", sub: b.plugged ? "O que o carregador pode entregar" : "Não está na tomada", value: b.plugged ? "\(b.adapterW) W" : "—")
+                    DetailRow(title: "Tensão e corrente", sub: "O que o carregador combinou com o Mac", value: b.plugged ? String(format: "%.0f V · %.1f A", b.adapterV, b.adapterA) : "—")
+                    DetailRow(title: "Estado", sub: b.pct >= 80 && b.plugged && !b.charging ? "Carga em pausa para poupar a bateria" : "", value: b.charging ? "A carregar" : b.plugged ? "Em pausa" : "Fora da tomada")
+                }
+            case .health:
+                detailHeading("SAÚDE DA BATERIA")
+                detailCard {
+                    DetailRow(title: "Capacidade máxima", sub: "Em relação a quando era nova", value: model.healthPct.map { "\($0)%" } ?? "—", fraction: model.healthPct.map { Double($0) / 100 })
+                    DetailRow(title: "Condição", sub: "Avaliação do macOS", value: model.healthWord.map { $0 == "Good" ? "Normal" : $0 } ?? "—")
+                    DetailRow(title: "De fábrica", sub: "Capacidade quando era nova", value: b.designmAh > 0 ? "\(b.designmAh) mAh" : "—")
+                    DetailRow(title: "Máxima agora", sub: "O quanto ainda consegue guardar", value: b.nominalmAh > 0 ? "\(b.nominalmAh) mAh" : "—")
+                }
+            case .cycles:
+                detailHeading("CICLOS DE CARGA")
+                detailCard {
+                    DetailRow(title: "Ciclos feitos", sub: "Cada 100% gastos contam 1 ciclo", value: "\(b.cycles)", fraction: min(Double(b.cycles) / 1000, 1))
+                    Text("A Apple projeta cerca de 1000 ciclos antes de a bateria perder uns 20% da capacidade.")
+                        .font(.system(size: 11)).foregroundStyle(muted).padding(.horizontal, 10).padding(.vertical, 8)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 206, maxHeight: 206, alignment: .topLeading)
     }
 }
 
@@ -808,41 +906,14 @@ struct BatView: View {
                     .animation(heroAnim, value: model.heroOn.contains(.bat) ? b.pct : 0)
 
                 HStack(spacing: 8) {
-                    Tile(label: b.watts >= 0 ? "A entrar" : "Consumo", value: String(format: "%.0f W", abs(b.watts)), dot: okColor)
-                    Tile(label: "Carregador", value: b.plugged ? "\(b.adapterW) W" : "—", dot: blueColor)
-                    Tile(label: "Saúde", value: model.healthPct.map { "\($0)%" } ?? "—", dot: warnColor)
-                    Tile(label: "Ciclos", value: "\(b.cycles)", dot: purpleColor)
+                    TileButton(label: b.watts >= 0 ? "A entrar" : "Consumo", value: String(format: "%.0f W", abs(b.watts)), dot: okColor, selected: model.batCard == .power) { model.batCard = .power }
+                    TileButton(label: "Carregador", value: b.plugged ? "\(b.adapterW) W" : "—", dot: blueColor, selected: model.batCard == .charger) { model.batCard = .charger }
+                    TileButton(label: "Saúde", value: model.healthPct.map { "\($0)%" } ?? "—", dot: warnColor, selected: model.batCard == .health) { model.batCard = .health }
+                    TileButton(label: "Ciclos", value: "\(b.cycles)", dot: purpleColor, selected: model.batCard == .cycles) { model.batCard = .cycles }
                 }
+                .animation(.easeOut(duration: 0.15), value: model.batCard)
 
-                if b.plugged && b.adapterW > 0 {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text("Potência do carregador").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
-                            Spacer()
-                            Text(String(format: "%.0f de %d W", max(b.watts, 0), b.adapterW)).font(.system(size: 12)).monospacedDigit().foregroundStyle(muted)
-                        }
-                        Bar(fraction: max(b.watts, 0) / Double(b.adapterW), height: 6)
-                    }
-                    .padding(12).glassCard()
-                }
-
-                let bv = model.history.compactMap { $0.batt }
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Bateria desde que o app abriu").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
-                        Spacer()
-                        if let f = bv.first, let l = bv.last, bv.count > 1 {
-                            Text(String(format: "%+.0f%%", l - f)).font(.system(size: 12)).monospacedDigit().foregroundStyle(muted)
-                        }
-                    }
-                    if bv.count > 1 {
-                        let lo = bv.min()!, hi = max(bv.max()!, lo + 10) // escala ajustada para variações pequenas aparecerem
-                        Spark(values: bv.map { ($0 - lo) / (hi - lo) }, color: okColor).frame(height: 34)
-                    } else {
-                        Text("A recolher dados…").font(.system(size: 11)).foregroundStyle(muted).frame(height: 34)
-                    }
-                }
-                .padding(12).glassCard()
+                BatDetail(model: model, b: b)
 
                 HStack(spacing: 10) {
                     Image(systemName: "leaf.fill").foregroundStyle(okColor).frame(width: 22)
@@ -860,6 +931,70 @@ struct BatView: View {
                 Text(model.tab == .bat ? "A ler a bateria…" : "").font(.system(size: 13)).foregroundStyle(muted).padding(.vertical, 40)
             }
         }
+    }
+}
+
+struct HealthDetail: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        let up = bootUptime(), total = model.diskTotal, free = model.diskFree
+        VStack(alignment: .leading, spacing: 4) {
+            switch model.healthCard {
+            case .disk:
+                detailHeading("ARMAZENAMENTO")
+                detailCard {
+                    DetailRow(title: "Livre", sub: "Disponível para usar", value: total > 0 ? gbText(free) : "—", fraction: total > 0 ? free / total : nil)
+                    DetailRow(title: "Usado", sub: "Apps, arquivos e sistema", value: total > 0 ? gbText(total - free) : "—", fraction: total > 0 ? (total - free) / total : nil)
+                    DetailRow(title: "Total", sub: model.diskModel ?? "", value: total > 0 ? gbText(total) : "—")
+                }
+            case .smart:
+                detailHeading("SAÚDE DO DISCO")
+                detailCard {
+                    DetailRow(title: "Estado SMART", sub: "O próprio disco avalia a sua saúde", value: model.smart == "Verified" ? "OK" : (model.smart ?? "—"))
+                    DetailRow(title: "Modelo", sub: "", value: model.diskModel ?? "—")
+                    DetailRow(title: "Tipo", sub: "", value: model.diskSolid.map { $0 ? "SSD" : "Disco rígido" } ?? "—")
+                }
+            case .uptime:
+                detailHeading("TEMPO LIGADO")
+                detailCard {
+                    DetailRow(title: "Ligado há", sub: "Contando o tempo em repouso", value: fmtUptime(up), fraction: min(up / (7 * 86400), 1))
+                    DetailRow(title: "Último arranque", sub: up > 7 * 86400 ? "Já faz mais de 7 dias: vale reiniciar" : "",
+                              value: Date().addingTimeInterval(-up).formatted(date: .abbreviated, time: .shortened))
+                }
+                detailHeading("ABREM AO LIGAR O MAC")
+                detailCard {
+                    if model.loginItems.isEmpty {
+                        Text("Nenhum item").font(.system(size: 12)).foregroundStyle(muted).padding(12).frame(maxWidth: .infinity)
+                    }
+                    ForEach(Array(model.loginItems.prefix(2)), id: \.self) { n in LoginRow(name: n) { model.removeLoginItem(n) } }
+                    if model.loginItems.count > 2 {
+                        Text("+\(model.loginItems.count - 2) mais").font(.system(size: 11)).foregroundStyle(muted).padding(8)
+                    }
+                }
+            case .thermal:
+                let t = thermalInfo(ProcessInfo.processInfo.thermalState)
+                detailHeading("TEMPERATURA")
+                detailCard { DetailRow(title: "Estado térmico", sub: t.sub, value: t.title) }
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 12) {
+                        Text("Atividade recente").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
+                        Spacer()
+                        HStack(spacing: 4) { Circle().fill(warnColor).frame(width: 6, height: 6); Text("RAM").font(.system(size: 10.5)).foregroundStyle(muted) }
+                        HStack(spacing: 4) { Circle().fill(purpleColor).frame(width: 6, height: 6); Text("CPU").font(.system(size: 10.5)).foregroundStyle(muted) }
+                    }
+                    if model.history.count > 1 {
+                        ZStack {
+                            Spark(values: model.history.map { $0.mem }, color: warnColor)
+                            Spark(values: model.history.map { $0.cpu }, color: purpleColor)
+                        }.frame(height: 34)
+                    } else {
+                        Text("A recolher dados…").font(.system(size: 11)).foregroundStyle(muted).frame(height: 34)
+                    }
+                }
+                .padding(12).glassCard()
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 236, alignment: .topLeading)
     }
 }
 
@@ -895,11 +1030,12 @@ struct HealthView: View {
             }
 
             HStack(spacing: 8) {
-                Tile(label: "Disco livre", value: model.diskTotal > 0 ? String(format: "%.0f GB", model.diskFree / gb) : "—", dot: okColor)
-                Tile(label: "SMART", value: model.smart == "Verified" ? "OK" : (model.smart ?? "—"), dot: blueColor)
-                Tile(label: "Ligado há", value: fmtUptime(bootUptime()), dot: warnColor)
-                Tile(label: "Térmico", value: thermal == .nominal ? "Normal" : thermal == .fair ? "Morno" : "Quente", dot: purpleColor)
+                TileButton(label: "Disco livre", value: model.diskTotal > 0 ? String(format: "%.0f GB", model.diskFree / gb) : "—", dot: okColor, selected: model.healthCard == .disk) { model.healthCard = .disk }
+                TileButton(label: "SMART", value: model.smart == "Verified" ? "OK" : (model.smart ?? "—"), dot: blueColor, selected: model.healthCard == .smart) { model.healthCard = .smart }
+                TileButton(label: "Ligado há", value: fmtUptime(bootUptime()), dot: warnColor, selected: model.healthCard == .uptime) { model.healthCard = .uptime }
+                TileButton(label: "Térmico", value: thermalInfo(thermal).title, dot: purpleColor, selected: model.healthCard == .thermal) { model.healthCard = .thermal }
             }
+            .animation(.easeOut(duration: 0.15), value: model.healthCard)
 
             HStack(spacing: 0) {
                 Label(fmtRate(model.down), systemImage: "arrow.down").frame(maxWidth: .infinity)
@@ -909,56 +1045,7 @@ struct HealthView: View {
             .font(.system(size: 13, weight: .medium)).monospacedDigit().foregroundStyle(.white)
             .padding(.vertical, 11).glassCard()
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("MAIS USAM A CPU").font(.system(size: 10.5, weight: .semibold)).tracking(0.7)
-                    .foregroundStyle(muted).padding(.horizontal, 10)
-                VStack(spacing: 0) {
-                    ForEach(Array(model.cpuRows.enumerated()), id: \.offset) { _, r in
-                        HStack(spacing: 10) {
-                            Image(nsImage: r.app.icon ?? NSImage()).resizable().frame(width: 22, height: 22)
-                            Text(r.app.localizedName ?? "?").font(.system(size: 12.5, weight: .medium)).foregroundStyle(.white).lineLimit(1)
-                            Spacer()
-                            Text(String(format: "%.0f%%", r.cpu)).font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(muted)
-                        }
-                        .padding(.vertical, 5).padding(.horizontal, 10)
-                    }
-                    if model.cpuRows.isEmpty { Text("A ler…").font(.system(size: 12)).foregroundStyle(muted).padding(10).frame(maxWidth: .infinity) }
-                }
-                .padding(.vertical, 3).glassCard()
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 12) {
-                    Text("Atividade recente").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
-                    Spacer()
-                    HStack(spacing: 4) { Circle().fill(warnColor).frame(width: 6, height: 6); Text("RAM").font(.system(size: 10.5)).foregroundStyle(muted) }
-                    HStack(spacing: 4) { Circle().fill(purpleColor).frame(width: 6, height: 6); Text("CPU").font(.system(size: 10.5)).foregroundStyle(muted) }
-                }
-                if model.history.count > 1 {
-                    ZStack {
-                        Spark(values: model.history.map { $0.mem }, color: warnColor)
-                        Spark(values: model.history.map { $0.cpu }, color: purpleColor)
-                    }.frame(height: 34)
-                } else {
-                    Text("A recolher dados…").font(.system(size: 11)).foregroundStyle(muted).frame(height: 34)
-                }
-            }
-            .padding(12).glassCard()
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("ABREM AO LIGAR O MAC").font(.system(size: 10.5, weight: .semibold)).tracking(0.7)
-                    .foregroundStyle(muted).padding(.horizontal, 10)
-                VStack(spacing: 0) {
-                    if model.loginItems.isEmpty {
-                        Text("Nenhum item").font(.system(size: 12)).foregroundStyle(muted).padding(12).frame(maxWidth: .infinity)
-                    }
-                    ForEach(Array(model.loginItems.prefix(2)), id: \.self) { n in LoginRow(name: n) { model.removeLoginItem(n) } }
-                    if model.loginItems.count > 2 {
-                        Text("+\(model.loginItems.count - 2) mais").font(.system(size: 11)).foregroundStyle(muted).padding(8)
-                    }
-                }
-                .padding(.vertical, 4).glassCard()
-            }
+            HealthDetail(model: model)
         }
     }
 }
@@ -1164,6 +1251,8 @@ class Delegate: NSObject, NSApplicationDelegate {
         #if DEBUG
         if CommandLine.arguments.contains("--show") {
             if let i = CommandLine.arguments.firstIndex(of: "--tab"), let t = Tab(rawValue: CommandLine.arguments[i + 1]) { model.tab = t }
+            if let i = CommandLine.arguments.firstIndex(of: "--bcard"), let c = BatCard(rawValue: CommandLine.arguments[i + 1]) { model.batCard = c }
+            if let i = CommandLine.arguments.firstIndex(of: "--hcard"), let c = HealthCard(rawValue: CommandLine.arguments[i + 1]) { model.healthCard = c }
             if let i = CommandLine.arguments.firstIndex(of: "--card"), let c = MemCard(rawValue: CommandLine.arguments[i + 1]) { model.memCard = c }
             if CommandLine.arguments.contains("--switch") { DispatchQueue.main.asyncAfter(deadline: .now() + 10) { self.model.tab = .health } }
             if CommandLine.arguments.contains("--back") { DispatchQueue.main.asyncAfter(deadline: .now() + 13) { self.model.tab = .mem } }

@@ -1,8 +1,9 @@
 # MemMonitor
 
 Medidor de **memória, bateria e saúde** do Mac na barra de menu. Clica no ícone da RAM e abre um painel com três abas:
-**Memória** (anel, quatro cards clicáveis — Apps, Sistema, Comprimida e CPU — com os detalhes de cada um embaixo, botão Fechar e Liberar memória), **Bateria** (percentual, potência do carregador, saúde, ciclos)
-e **Saúde** (selo geral, disco, rede, CPU e itens de início).
+**Memória** (anel, botão Fechar e Liberar memória), **Bateria** (percentual, potência, carregador, saúde, ciclos e modo de pouca energia)
+e **Saúde** (selo geral, disco, SMART, tempo ligado com itens de início, temperatura e rede).
+Nas três abas, os **quatro cards abaixo do anel são clicáveis**: o selecionado mostra os detalhes por baixo.
 
 Requisitos: Mac com **chip Apple** (M1 ou mais novo) e **macOS 14+**.
 
