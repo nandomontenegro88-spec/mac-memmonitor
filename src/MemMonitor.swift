@@ -311,6 +311,9 @@ func thermalInfo(_ t: ProcessInfo.ThermalState) -> (title: String, sub: String) 
 
 enum Tab: String, CaseIterable { case mem = "Memória", cpu = "CPU", bat = "Bateria", health = "Saúde" }
 
+/// Espaço do disco: `free` é o livre de verdade (o que o Finder mostra); `purgeable` é o que o macOS apaga sozinho se faltar espaço (cache, etc.).
+struct DiskInfo: Equatable { var free = 0.0, total = 0.0, purgeable = 0.0 }
+
 struct Live: Equatable { var cpu: Double; var temp: Double? }
 
 /// Tudo o que a aba CPU mostra, num só valor: uma atualização = uma passagem de desenho (e não seis).
@@ -355,8 +358,10 @@ final class Model: ObservableObject {
     @Published var healthWord: String?
     @Published var lowPower = false
     @Published var smart: String?
-    @Published var diskFree = 0.0
-    @Published var diskTotal = 0.0
+    @Published var disk = DiskInfo()
+    var diskFree: Double { disk.free }
+    var diskTotal: Double { disk.total }
+    var diskPurgeable: Double { disk.purgeable }
     @Published var down = 0.0
     @Published var up = 0.0
     @Published var loginItems: [String] = []
@@ -414,6 +419,12 @@ final class Model: ObservableObject {
         }
         guard visible else { return } // fechado: só a RAM, que alimenta o número da barra
         let c = (panelCPU.read() * 100).rounded() / 100
+        if tab == .health {
+            let v = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeAvailableCapacityKey, .volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
+            let free = Double(v?.volumeAvailableCapacity ?? 0)
+            let d = DiskInfo(free: free, total: Double(v?.volumeTotalCapacity ?? 0), purgeable: max(Double(v?.volumeAvailableCapacityForImportantUsage ?? 0) - free, 0))
+            if d != disk { disk = d }
+        }
         let k = coreMeter.read() // barato; lê sempre para a janela de tempo ser curta quando abres a aba CPU
         if tab == .cpu || tab == .health {
             var d = cpuData
@@ -466,7 +477,7 @@ final class Model: ObservableObject {
                 pct = Int((h["sppower_battery_health_maximum_capacity"] as? String ?? "").replacingOccurrences(of: "%", with: ""))
                 word = h["sppower_battery_health"] as? String
             }
-            var lp: Bool?, smart: String?, dModel: String?, dSolid: Bool?, v: URLResourceValues?, items: [String]?
+            var lp: Bool?, smart: String?, dModel: String?, dSolid: Bool?, items: [String]?
             if tab == .bat { lp = lowPowerOn(shText("/usr/bin/pmset", ["-g"])) }
             if tab == .health {
                 func field(_ text: String, _ k: String) -> String? {
@@ -474,7 +485,6 @@ final class Model: ObservableObject {
                 }
                 let root = shText("/usr/sbin/diskutil", ["info", "/"]), disk = shText("/usr/sbin/diskutil", ["info", "disk0"]) // o modelo só aparece no disco físico
                 smart = field(root, "SMART Status"); dSolid = field(root, "Solid State").map { $0 == "Yes" }; dModel = field(disk, "Device / Media Name")
-                v = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
                 // um nome por linha: nomes com vírgula não se partem em dois
                 items = shText("/usr/bin/osascript", ["-e", "tell application \"System Events\" to set n to name of every login item",
                                                       "-e", "set AppleScript's text item delimiters to linefeed", "-e", "return n as text"])
@@ -486,8 +496,6 @@ final class Model: ObservableObject {
                 if let lp { self.lowPower = lp }
                 if tab == .health {
                     self.smart = smart; self.diskModel = dModel; self.diskSolid = dSolid
-                    self.diskFree = Double(v?.volumeAvailableCapacityForImportantUsage ?? 0)
-                    self.diskTotal = Double(v?.volumeTotalCapacity ?? 0)
                     self.loginItems = items ?? []
                 }
             }
@@ -832,6 +840,8 @@ struct PctHero: View, Animatable {
 }
 
 func gbText(_ bytes: Double) -> String { String(format: "%.1f GB", bytes / gb) }
+/// Disco em GB decimais (1 GB = 10⁹ bytes), a mesma unidade do Finder; a RAM usa GB binários, como o Monitor de Atividade.
+func diskText(_ bytes: Double) -> String { String(format: "%.1f GB", bytes / 1e9) }
 
 /// Uma linha de detalhe: título, explicação curta, valor e (opcional) barra.
 struct DetailRow: View {
@@ -1185,9 +1195,10 @@ struct HealthDetail: View {
             case .disk:
                 detailHeading("ARMAZENAMENTO")
                 detailCard {
-                    DetailRow(title: "Livre", sub: "Disponível para usar", value: total > 0 ? gbText(free) : "—", fraction: total > 0 ? free / total : nil)
-                    DetailRow(title: "Usado", sub: "Apps, arquivos e sistema", value: total > 0 ? gbText(total - free) : "—", fraction: total > 0 ? (total - free) / total : nil)
-                    DetailRow(title: "Total", sub: model.diskModel ?? "", value: total > 0 ? gbText(total) : "—")
+                    DetailRow(title: "Livre", sub: "O mesmo valor do Finder", value: total > 0 ? diskText(free) : "—", fraction: total > 0 ? free / total : nil)
+                    DetailRow(title: "Liberável pelo macOS", sub: "Cache e arquivos que ele apaga se faltar espaço", value: total > 0 ? diskText(model.diskPurgeable) : "—", fraction: total > 0 ? model.diskPurgeable / total : nil)
+                    DetailRow(title: "Usado", sub: "Apps, arquivos e sistema", value: total > 0 ? diskText(total - free) : "—", fraction: total > 0 ? (total - free) / total : nil)
+                    DetailRow(title: "Total", sub: model.diskModel ?? "", value: total > 0 ? diskText(total) : "—")
                 }
             case .smart:
                 detailHeading("SAÚDE DO DISCO")
@@ -1275,7 +1286,7 @@ struct HealthView: View {
             }
 
             HStack(spacing: 8) {
-                TileButton(label: "Disco livre", value: model.diskTotal > 0 ? String(format: "%.0f GB", model.diskFree / gb) : "—", dot: okColor, selected: model.healthCard == .disk) { model.healthCard = .disk }
+                TileButton(label: "Disco livre", value: model.diskTotal > 0 ? String(format: "%.0f GB", model.diskFree / 1e9) : "—", dot: okColor, selected: model.healthCard == .disk) { model.healthCard = .disk }
                 TileButton(label: "SMART", value: model.smart == "Verified" ? "OK" : (model.smart ?? "—"), dot: blueColor, selected: model.healthCard == .smart) { model.healthCard = .smart }
                 TileButton(label: "Ligado há", value: fmtUptime(bootUptime()), dot: warnColor, selected: model.healthCard == .uptime) { model.healthCard = .uptime }
                 TileButton(label: "Térmico", value: model.temps.map { "\(Int($0.cpuAvg.rounded()))°" } ?? thermalInfo(thermal).title, dot: purpleColor, selected: model.healthCard == .thermal) { model.healthCard = .thermal }
